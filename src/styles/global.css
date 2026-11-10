@@ -1,0 +1,21 @@
+/* Deux panneaux : partage de la largeur ; un panneau : toute la largeur. */
+.listing-details-panels {
+  width: 100% !important;
+}
+
+.listing-details-panel {
+  flex: 1 1 0 !important;
+  width: auto !important;
+  min-width: 0 !important;
+}
+
+@media (max-width: 750px) {
+  .listing-details-panels {
+    flex-direction: column !important;
+  }
+
+  .listing-details-panel {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+  }
+}
