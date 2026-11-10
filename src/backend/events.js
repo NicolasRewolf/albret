@@ -56,6 +56,9 @@ function createMediaImportReceiptHandler({ lookupIntent, lookupReceipt, insertRe
     if (intent.key !== receipt.key || intent.operationId !== receipt.operationId || intent.sourceUrl !== receipt.sourceUrl || intent.version !== receipt.version || intent.fileUrl !== void 0 && intent.fileUrl !== receipt.fileUrl || intent.sourceMimeType !== void 0 && intent.sourceMimeType !== info.mimeType) {
       fail("MEDIA_RECEIPT_INTENT_CONFLICT");
     }
+    if (intent.fileUrl === receipt.fileUrl && ["pending", "ready"].includes(intent.status)) {
+      return { status: "not-needed" };
+    }
     const existing = await call(lookupReceipt, "MEDIA_RECEIPT_READ_FAILED", receipt.operationId);
     if (existing !== null) {
       if (!identical(existing, receipt)) fail("MEDIA_RECEIPT_CONFLICT");

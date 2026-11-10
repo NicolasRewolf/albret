@@ -67,9 +67,13 @@ var HEKTOR = Object.freeze({
     maxImageBytes: 8 * 1024 * 1024,
     maxTotalImageBytes: 32 * 1024 * 1024,
     maxPhotoReferences: 1e3,
-    // Wix imports by URL without downloading bytes in Velo: 50 admissions per
-    // run within an 8 s budget. ~45 listings × ~11 photos ≈ 10 runs at start.
-    maxOperationsPerRun: 50,
+    // Wix imports by URL without downloading bytes in Velo. 40 new photos per
+    // run within an 8 s budget (file read included): ~45 listings × ~11 photos
+    // ≈ 13 runs for the very first import, then only the changed photos.
+    // Sized for the 60 write requests a minute of the free plan, worst case:
+    // 2 grouped writes per chunk + one receipt per photo if every media event
+    // arrives before its chunk is recorded + lock, log and state ≈ 50.
+    maxOperationsPerRun: 40,
     maxRunMs: 8e3,
     remote: Object.freeze({
       enabled: true,
@@ -85,10 +89,23 @@ var HEKTOR = Object.freeze({
       // Host of the agency's photos on the current LBI site. Confirm on the
       // first real file: inspectHektorExport lists the hosts actually used.
       allowedHosts: Object.freeze(["agencealbret.staticlbi.com"]),
+      // New photos are imported in chunks: two grouped CMS writes per chunk,
+      // whatever its size.
+      batchSize: 20,
+      concurrency: 5,
       maxRequests: 100,
       maxDownloadedBytes: 32 * 1024 * 1024,
       timeoutMs: 8e3
     })
+  }),
+  // Wix site notifications sent by the scheduled import when it fails, is
+  // suspended, or leaves listings on hold. Recipients are chosen by site role
+  // ('Owner' or 'All_Contributors'); no e-mail address is stored.
+  alerts: Object.freeze({
+    enabled: true,
+    channels: Object.freeze(["Dashboard", "Browser", "Mobile"]),
+    recipientsRole: "Owner",
+    actionUrl: "https://manage.wix.com/dashboard/c49e2d70-3b2c-4dc7-9dc5-eeb606dfc9b5/wix-cms/"
   }),
   bridgeUrlSecret: "HEKTOR_BRIDGE_URL",
   // complete HTTPS /v1/snapshot URL
@@ -1176,37 +1193,37 @@ function decodePoliris(bytes, encoding) {
     encoding = detected === "windows-1252" ? "windows-1252" : "utf-8";
   }
   try {
-    const text2 = new TextDecoder(encoding, { fatal: true }).decode(bytes);
-    if (text2.includes("�")) fail2("POLIRIS_INVALID_ENCODING");
-    return text2;
+    const text3 = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+    if (text3.includes("�")) fail2("POLIRIS_INVALID_ENCODING");
+    return text3;
   } catch {
     fail2("POLIRIS_INVALID_ENCODING");
   }
 }
-function parseRows(text2) {
-  if (!text2) fail2("POLIRIS_EMPTY_EXPORT");
+function parseRows(text3) {
+  if (!text3) fail2("POLIRIS_EMPTY_EXPORT");
   const rows = [];
   let row = [];
   let cursor = 0;
-  while (cursor < text2.length) {
-    if (text2[cursor] !== '"') fail2("POLIRIS_INVALID_CSV");
-    const end = text2.indexOf('"', cursor + 1);
+  while (cursor < text3.length) {
+    if (text3[cursor] !== '"') fail2("POLIRIS_INVALID_CSV");
+    const end = text3.indexOf('"', cursor + 1);
     if (end === -1) fail2("POLIRIS_INVALID_CSV");
-    const field = text2.slice(cursor + 1, end);
+    const field = text3.slice(cursor + 1, end);
     if (CONTROL.test(field)) fail2("POLIRIS_INVALID_CSV");
     row.push(field);
     if (row.length > FIELD_COUNT) fail2("POLIRIS_FIELD_COUNT");
     cursor = end + 1;
-    if (text2.startsWith("!#", cursor)) {
+    if (text3.startsWith("!#", cursor)) {
       cursor += 2;
-      if (cursor === text2.length) fail2("POLIRIS_INVALID_CSV");
+      if (cursor === text3.length) fail2("POLIRIS_INVALID_CSV");
       continue;
     }
-    if (cursor !== text2.length && !text2.startsWith("\r\n", cursor)) fail2("POLIRIS_INVALID_CSV");
+    if (cursor !== text3.length && !text3.startsWith("\r\n", cursor)) fail2("POLIRIS_INVALID_CSV");
     if (row.length !== FIELD_COUNT) fail2("POLIRIS_FIELD_COUNT");
     rows.push(row);
     row = [];
-    if (cursor < text2.length) cursor += 2;
+    if (cursor < text3.length) cursor += 2;
   }
   return rows;
 }
@@ -2178,11 +2195,14 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
   }
   if (!object2(mediaStore)) fail4("HEKTOR_INGEST_DEPENDENCIES_INVALID");
   if (config?.media?.maxRunMs !== void 0 && (!Number.isSafeInteger(config.media.maxRunMs) || config.media.maxRunMs <= 0)) fail4("MEDIA_INVALID_LIMIT");
-  async function prepare({ allowMediaWrites = false } = {}) {
+  async function prepare({ allowMediaWrites = false, unchangedSince } = {}) {
     const started = now();
     const readiness = hektorSftpReadiness(config);
     if (!readiness.configurationReady) fail4("HEKTOR_SOURCE_NOT_CONFIGURED");
-    const { bytes, context } = await readSource(config.sftp);
+    const read = await readSource(config.sftp, unchangedSince ? { unchangedSince } : void 0);
+    if (read?.unchanged === true) return { unchanged: true, snapshot: null, summary: null, source: read.context };
+    const { bytes, context } = read;
+    const source = { size: bytes.length, sourceModifiedAt: context.sourceModifiedAt, sha256: context.rawSha256 };
     const draft = await prepareArchive(bytes, context, {
       ...config.poliris,
       maxSnapshotAgeMs: config.maxAgeMs
@@ -2209,7 +2229,15 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
     }));
     let attempted = 0;
     let budgetExhausted = false;
-    if (allowMediaWrites && inputs.direct) {
+    const grouped = Boolean(inputs.direct) && typeof mediaStore.commitReadyMany === "function" && typeof mediaStore.ensureRemoteMany === "function";
+    if (allowMediaWrites && inputs.direct && grouped) {
+      const keys = [...inputs.unique.keys()].filter((key) => states.get(key)?.ready && states.get(key).needsPersistence === true);
+      if (keys.length) {
+        if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
+        const committed = await mediaStore.commitReadyMany(keys.map((key) => states.get(key)));
+        keys.forEach((key, index) => states.set(key, committed[index]));
+      }
+    } else if (allowMediaWrites && inputs.direct) {
       for (const [key, input] of inputs.unique) {
         const state = states.get(key);
         if (!state?.ready || state.needsPersistence !== true) continue;
@@ -2223,7 +2251,24 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
     }
     const omitFailed = Boolean(inputs.direct) && config.media.remote?.failedPhotos === "omit";
     const recoveryRequired = [...states.values()].some((state) => state?.status === "recovery-required" || !omitFailed && state?.status === "failed");
-    if (allowMediaWrites && !recoveryRequired && !budgetExhausted) {
+    if (allowMediaWrites && !recoveryRequired && !budgetExhausted && grouped) {
+      const missing = [...inputs.unique].filter(([key]) => states.get(key)?.status === "missing").slice(0, config.media.maxOperationsPerRun);
+      if (missing.length) {
+        if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
+        const remote = config.media.remote || {};
+        const batch = await mediaStore.ensureRemoteMany(missing.map(([, input]) => input), {
+          // Admission limit only, as below: a started chunk always completes.
+          admit: () => config.media.maxRunMs === void 0 || now() - started < config.media.maxRunMs,
+          ...remote.batchSize !== void 0 ? { chunkSize: remote.batchSize } : {},
+          ...remote.concurrency !== void 0 ? { concurrency: remote.concurrency } : {}
+        });
+        missing.forEach(([key], index) => {
+          if (batch.states[index]) states.set(key, batch.states[index]);
+        });
+        attempted = batch.attempted;
+        budgetExhausted = batch.stopped === true;
+      }
+    } else if (allowMediaWrites && !recoveryRequired && !budgetExhausted) {
       for (const [key, input] of inputs.unique) {
         const state = states.get(key);
         if (state.ready || state.status === "recovery-required" || state.status === "failed") continue;
@@ -2289,7 +2334,7 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
         ...budgetExhausted ? ["MEDIA_TIME_BUDGET_EXHAUSTED"] : []
       ]
     };
-    if (!ready) return { snapshot: null, summary: resultSummary };
+    if (!ready) return { snapshot: null, summary: resultSummary, source };
     const items = inputs.listings.map(({ fields, photos }) => ({
       ...fields,
       photos: photos.filter(({ key }) => states.get(key)?.ready === true).map(({ key, alt }) => {
@@ -2302,7 +2347,7 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
       })
     }));
     const snapshot = validateSnapshot({ ...draft.metadata, items }, config);
-    return { snapshot, summary: resultSummary };
+    return { snapshot, summary: resultSummary, source };
   }
   return Object.freeze({
     readiness: () => hektorSftpReadiness(config),
@@ -2313,6 +2358,17 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
     async stageFeedMedia() {
       if (config.mediaPreparationEnabled !== true) fail4("HEKTOR_MEDIA_PREPARATION_DISABLED");
       return (await prepare({ allowMediaWrites: true })).summary;
+    },
+    /**
+     * One read of the delivery for a whole run: stages what is missing when
+     * allowed, and returns { snapshot, summary, source } - snapshot is null
+     * until every photo is settled - or { unchanged: true } when the remote
+     * file is the one named by unchangedSince.
+     */
+    async runFeed({ allowMediaWrites = false, unchangedSince } = {}) {
+      if (config.enabled !== true) fail4("HEKTOR_SYNC_DISABLED");
+      if (allowMediaWrites && config.mediaPreparationEnabled !== true) fail4("HEKTOR_MEDIA_PREPARATION_DISABLED");
+      return prepare({ allowMediaWrites, unchangedSince });
     },
     async readSnapshot({ dryRun = true } = {}) {
       if (!dryRun && config.enabled !== true) fail4("HEKTOR_SYNC_DISABLED");
@@ -2402,9 +2458,11 @@ async function readHektorSftp(input, dependencies) {
     readSecret,
     createSocket = () => new Socket(),
     now = Date.now,
-    wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    unchangedSince
   } = dependencies || {};
   if (typeof createClient !== "function" || typeof readSecret !== "function") fail5("SFTP_CONFIG_INVALID");
+  if (unchangedSince !== void 0 && (unchangedSince === null || typeof unchangedSince !== "object" || !Number.isSafeInteger(unchangedSince.size) || unchangedSince.size <= 0 || typeof unchangedSince.sourceModifiedAt !== "string" || !Number.isFinite(Date.parse(unchangedSince.sourceModifiedAt)))) fail5("SFTP_CONFIG_INVALID");
   let client, socket, writer, timer, stopped = false, closing = false;
   let failure, rejectFailure, phase = "SFTP_SECRET_UNAVAILABLE";
   const failed = new Promise((_, reject) => {
@@ -2465,6 +2523,12 @@ async function readHektorSftp(input, dependencies) {
     const before = await client.stat(config.remoteFile);
     active();
     checkFile(before, config, now());
+    if (unchangedSince && before.size === unchangedSince.size && before.modifyTime === Date.parse(unchangedSince.sourceModifiedAt)) {
+      return { unchanged: true, context: {
+        size: before.size,
+        sourceModifiedAt: new Date(before.modifyTime).toISOString()
+      } };
+    }
     await wait(config.stabilityMs);
     active();
     unchanged(before, await client.stat(config.remoteFile));
@@ -2678,7 +2742,9 @@ function createMediaUrlCache({
   checkReady,
   resolvePublicUrl,
   lookupReceipt,
-  createOperationId = ({ key }) => key
+  createOperationId = ({ key }) => key,
+  saveMany,
+  forgetReceipts
 }, {
   maxImageBytes = 15 * 1024 * 1024,
   // Production scale: a record persisted as READY was verified (Wix READY,
@@ -2691,8 +2757,17 @@ function createMediaUrlCache({
   }
   if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes < 1) fail7("MEDIA_INVALID_LIMIT");
   if (typeof createOperationId !== "function" || lookupReceipt !== void 0 && typeof lookupReceipt !== "function") fail7("MEDIA_INVALID_DEPENDENCIES");
+  for (const fn of [saveMany, forgetReceipts]) {
+    if (fn !== void 0 && typeof fn !== "function") fail7("MEDIA_INVALID_DEPENDENCIES");
+  }
   const inFlight = /* @__PURE__ */ new Map();
   const state = (key, status) => ({ ready: false, key, status });
+  const unpersisted = /* @__PURE__ */ new WeakMap();
+  async function persist(records) {
+    if (!records.length) return;
+    if (saveMany) await call2(saveMany, "MEDIA_CACHE_WRITE_FAILED", records);
+    else for (const record of records) await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
+  }
   async function identify({ reference, version, mimeType, sizeInBytes, contentHash } = {}) {
     const sourceUrl = sourceReference(reference);
     if (version !== void 0 && (typeof version !== "string" || !version || version.length > 256 || version !== version.trim() || /[\x00-\x1f\x7f]/.test(version))) fail7("MEDIA_INVALID_SOURCE_VERSION");
@@ -2751,7 +2826,8 @@ function createMediaUrlCache({
         sizeInBytes: info.sizeInBytes
       });
     }
-    return {
+    const needsPersistence = !prepare && identity.version !== void 0 && (record.status !== "ready" || record.publicUrl !== url);
+    const result = {
       ready: true,
       key,
       fileUrl: record.fileUrl,
@@ -2760,8 +2836,18 @@ function createMediaUrlCache({
       sizeInBytes: info.sizeInBytes,
       width: info.width,
       height: info.height,
-      ...!prepare && identity.version !== void 0 && (record.status !== "ready" || record.publicUrl !== url) ? { needsPersistence: true } : {}
+      ...needsPersistence ? { needsPersistence: true } : {}
     };
+    if (needsPersistence) {
+      unpersisted.set(result, {
+        ...record,
+        status: "ready",
+        publicUrl: url,
+        mimeType: info.mimeType,
+        sizeInBytes: info.sizeInBytes
+      });
+    }
+    return result;
   }
   async function resolve(identity, prepare) {
     const { sourceUrl, key } = identity;
@@ -2858,7 +2944,96 @@ function createMediaUrlCache({
     delete result.needsPersistence;
     return result;
   }
-  return Object.freeze({ inspectRemote, ensureRemote, adoptRemote });
+  async function commitReadyMany(states) {
+    if (!Array.isArray(states)) fail7("MEDIA_INVALID_BATCH");
+    const records = [];
+    const results = states.map((current) => {
+      const record = object4(current) ? unpersisted.get(current) : void 0;
+      if (!record) return current;
+      records.push(record);
+      const { needsPersistence, ...committed } = current;
+      return committed;
+    });
+    await persist(records);
+    for (const current of states) if (object4(current)) unpersisted.delete(current);
+    const operations = records.map((record) => record.operationId).filter(Boolean);
+    if (forgetReceipts && operations.length) await forgetReceipts(operations).catch(() => {
+    });
+    return results;
+  }
+  async function ensureRemoteMany(inputs, { admit = () => true, chunkSize = 10, concurrency = 5 } = {}) {
+    if (!Array.isArray(inputs) || typeof admit !== "function" || !Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > 100 || !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 20) fail7("MEDIA_INVALID_BATCH");
+    const identities = [];
+    for (const input of inputs) identities.push(await identify(input));
+    const states = new Array(inputs.length);
+    const byKey = /* @__PURE__ */ new Map();
+    let attempted = 0;
+    let stopped = false;
+    for (let start = 0; start < inputs.length; start += chunkSize) {
+      if (!admit()) {
+        stopped = true;
+        break;
+      }
+      const fresh = [];
+      const aliases = [];
+      for (let index = start; index < Math.min(start + chunkSize, inputs.length); index++) {
+        const identity = identities[index];
+        if (byKey.has(identity.key)) {
+          aliases.push(index);
+          continue;
+        }
+        byKey.set(identity.key, void 0);
+        const existing = await call2(lookup2, "MEDIA_CACHE_READ_FAILED", identity.key);
+        if (existing !== null) {
+          byKey.set(identity.key, states[index] = await resolve(identity, true));
+          continue;
+        }
+        const operationId = await call2(createOperationId, "MEDIA_OPERATION_ID_FAILED", identity);
+        if (typeof operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(operationId)) fail7("MEDIA_INVALID_OPERATION_ID");
+        fresh.push({ index, identity, record: { ...identity, operationId, status: "importing" } });
+      }
+      await persist(fresh.map((entry) => entry.record));
+      attempted += fresh.length;
+      const queue = [...fresh];
+      const outcomes = [];
+      await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+        while (queue.length) {
+          const { index, identity, record } = queue.shift();
+          let imported;
+          let next;
+          try {
+            imported = await importFile({
+              reference: identity.sourceUrl,
+              key: identity.key,
+              operationId: record.operationId,
+              ...identity.version !== void 0 ? { version: identity.version } : {},
+              ...identity.sourceMimeType ? { mimeType: identity.sourceMimeType } : {}
+            });
+          } catch {
+            next = "unresolved";
+          }
+          if (!next) {
+            if (object4(imported) && imported.opStatus === "FAILED") next = "failed";
+            else if (!object4(imported) || !imageId(imported.fileUrl) || imported.sourceUrl !== void 0 && imported.sourceUrl !== identity.sourceUrl) next = "unresolved";
+            else next = "pending";
+          }
+          outcomes.push({
+            index,
+            key: identity.key,
+            status: next,
+            record: { ...record, status: next, ...next === "pending" ? { fileUrl: imported.fileUrl } : {} }
+          });
+        }
+      }));
+      await persist(outcomes.map((outcome) => outcome.record));
+      for (const { index, key, status } of outcomes) {
+        byKey.set(key, states[index] = state(key, status === "unresolved" ? "recovery-required" : status));
+      }
+      for (const index of aliases) states[index] = byKey.get(identities[index].key);
+    }
+    return { states, attempted, stopped };
+  }
+  return Object.freeze({ inspectRemote, ensureRemote, adoptRemote, ensureRemoteMany, commitReadyMany });
 }
 
 // velo/backend/lib/media-readiness.js
@@ -2969,6 +3144,25 @@ function createHektorMediaStore({
     }
     return { prefetched: prefetched.size };
   }
+  const urlRow = (record) => ({
+    _id: urlIdFor(record.key),
+    sourceUrlHash: record.key,
+    sourceUrl: record.sourceUrl,
+    status: record.status,
+    ...record.fileUrl ? { fileUrl: record.fileUrl } : {},
+    ...record.publicUrl ? { publicUrl: record.publicUrl } : {},
+    ...record.mimeType ? { mimeType: record.mimeType } : {},
+    ...record.sizeInBytes !== void 0 ? { sizeInBytes: record.sizeInBytes } : {},
+    ...Object.fromEntries([
+      "version",
+      "operationId",
+      "contentHash",
+      "sourceMimeType",
+      "sourceSizeInBytes",
+      "adoptionEvidence"
+    ].filter((name) => record[name] !== void 0).map((name) => [name, record[name]])),
+    updatedAt: /* @__PURE__ */ new Date()
+  });
   const urlCache = createMediaUrlCache({
     hashReference,
     async lookup(key) {
@@ -2993,25 +3187,22 @@ function createHektorMediaStore({
     },
     async save(record) {
       prefetched.delete(urlIdFor(record.key));
-      await wixData.save(cacheCollection, {
-        _id: urlIdFor(record.key),
-        sourceUrlHash: record.key,
-        sourceUrl: record.sourceUrl,
-        status: record.status,
-        ...record.fileUrl ? { fileUrl: record.fileUrl } : {},
-        ...record.publicUrl ? { publicUrl: record.publicUrl } : {},
-        ...record.mimeType ? { mimeType: record.mimeType } : {},
-        ...record.sizeInBytes !== void 0 ? { sizeInBytes: record.sizeInBytes } : {},
-        ...Object.fromEntries([
-          "version",
-          "operationId",
-          "contentHash",
-          "sourceMimeType",
-          "sourceSizeInBytes",
-          "adoptionEvidence"
-        ].filter((name) => record[name] !== void 0).map((name) => [name, record[name]])),
-        updatedAt: /* @__PURE__ */ new Date()
-      }, WRITE2);
+      await wixData.save(cacheCollection, urlRow(record), WRITE2);
+    },
+    // bulkSave counts as ONE request against the per-minute write quota.
+    async saveMany(records) {
+      for (const record of records) prefetched.delete(urlIdFor(record.key));
+      const result = await wixData.bulkSave(cacheCollection, records.map(urlRow), WRITE2);
+      if (!result || Array.isArray(result.errors) && result.errors.length || (result.inserted || 0) + (result.updated || 0) + (result.skipped || 0) !== records.length) {
+        throw new Error("MEDIA_CACHE_BULK_WRITE_INCOMPLETE");
+      }
+    },
+    async forgetReceipts(operationIds) {
+      await wixData.bulkRemove(
+        cacheCollection,
+        operationIds.map((operationId) => `receipt_${operationId.slice(0, 24)}`),
+        WRITE2
+      );
     },
     async lookupReceipt(operationId) {
       const result = await wixData.query(cacheCollection).eq("_id", `receipt_${operationId.slice(0, 24)}`).limit(1).find(READ2);
@@ -3069,7 +3260,18 @@ function createHektorMediaStore({
       evidence: { type: "byte-cache", contentHash: input.contentHash }
     });
   }
-  return Object.freeze({ ...byteCache, ...urlCache, ensureRemote, prefetchRemote });
+  async function ensureRemoteMany(inputs, options = {}) {
+    if (!inputs.some((input) => input.contentHash)) return urlCache.ensureRemoteMany(inputs, options);
+    const states = new Array(inputs.length);
+    let attempted = 0;
+    for (const [index, input] of inputs.entries()) {
+      if (typeof options.admit === "function" && !options.admit()) return { states, attempted, stopped: true };
+      states[index] = await ensureRemote(input);
+      attempted++;
+    }
+    return { states, attempted, stopped: false };
+  }
+  return Object.freeze({ ...byteCache, ...urlCache, ensureRemote, ensureRemoteMany, prefetchRemote });
 }
 
 // velo/backend/lib/sync-engine.js
@@ -3138,7 +3340,7 @@ function planSnapshot(snapshot, existing, {
   approvedRemovalFingerprint,
   publicSource: publicSource2 = "hektor"
 }) {
-  const fingerprint = hash2(snapshot);
+  const fingerprint2 = hash2(snapshot);
   const records = snapshot.items.filter((item) => item.publication === "published").map((item) => toPublicItem(item, { idFor: idFor2, hash: hash2, publicSource: publicSource2 }));
   if (new Set(records.map((item) => item._id)).size !== records.length) throw new Error("ID_COLLISION");
   const old = new Map(existing.map((item) => [item._id, item]));
@@ -3151,11 +3353,11 @@ function planSnapshot(snapshot, existing, {
   if (existing.length && !records.length) reasons.push("EMPTY_PUBLIC_CATALOG");
   if (removals.length > maxRemovals || removals.length > smallRemovalAllowance && removals.length / existing.length > maxRemovalRatio) reasons.push("EXCESSIVE_REMOVALS");
   if (saves.length + removals.length > maxWrites) reasons.push("WRITE_BUDGET_EXCEEDED");
-  const approved = approvedRemovalFingerprint === fingerprint;
+  const approved = approvedRemovalFingerprint === fingerprint2;
   const blocks = reasons.filter((reason) => !(approved && ["EMPTY_PUBLIC_CATALOG", "EXCESSIVE_REMOVALS"].includes(reason)));
-  return { fingerprint, saves, removals, blocks, summary: {
+  return { fingerprint: fingerprint2, saves, removals, blocks, summary: {
     snapshotId: snapshot.snapshotId,
-    fingerprint,
+    fingerprint: fingerprint2,
     published: records.length,
     save: saves.length,
     remove: removals.length,
@@ -3171,10 +3373,10 @@ async function synchronize(deps, options = {}) {
   try {
     const snapshot = await deps.readSnapshot();
     const state = await deps.getState();
-    const fingerprint = deps.hash(snapshot);
+    const fingerprint2 = deps.hash(snapshot);
     if (state) {
       if (Date.parse(snapshot.generatedAt) < Date.parse(state.generatedAt)) throw new Error("OUT_OF_ORDER_SNAPSHOT");
-      if ((snapshot.snapshotId === state.snapshotId || snapshot.generatedAt === state.generatedAt) && fingerprint !== state.fingerprint) throw new Error("SNAPSHOT_CONFLICT");
+      if ((snapshot.snapshotId === state.snapshotId || snapshot.generatedAt === state.generatedAt) && fingerprint2 !== state.fingerprint) throw new Error("SNAPSHOT_CONFLICT");
     }
     const existing = await deps.listPublic();
     const plan = planSnapshot(snapshot, existing, { ...deps, ...options });
@@ -3183,12 +3385,16 @@ async function synchronize(deps, options = {}) {
       await deps.logRun(result);
       return result;
     }
-    for (const record of plan.saves) await deps.savePublic(record);
-    for (const id of plan.removals) await deps.removePublic(id);
+    if (typeof deps.saveManyPublic === "function") {
+      if (plan.saves.length) await deps.saveManyPublic(plan.saves);
+    } else for (const record of plan.saves) await deps.savePublic(record);
+    if (typeof deps.removeManyPublic === "function") {
+      if (plan.removals.length) await deps.removeManyPublic(plan.removals);
+    } else for (const id of plan.removals) await deps.removePublic(id);
     await deps.saveState({
       snapshotId: snapshot.snapshotId,
       generatedAt: snapshot.generatedAt,
-      fingerprint,
+      fingerprint: fingerprint2,
       completedAt: /* @__PURE__ */ new Date(),
       publicCount: plan.summary.published
     });
@@ -3205,6 +3411,200 @@ async function synchronize(deps, options = {}) {
   }
 }
 
+// velo/backend/lib/feed-pass.js
+function deliveryIdentity(source) {
+  if (!source || !Number.isSafeInteger(source.size) || source.size <= 0 || typeof source.sourceModifiedAt !== "string" || !Number.isFinite(Date.parse(source.sourceModifiedAt))) return {};
+  return {
+    fileSize: source.size,
+    fileModifiedAt: new Date(source.sourceModifiedAt).toISOString(),
+    ...typeof source.sha256 === "string" && /^[a-f0-9]{64}$/.test(source.sha256) ? { fileSha256: source.sha256 } : {}
+  };
+}
+function knownDelivery(state) {
+  const modified = state?.fileModifiedAt instanceof Date ? state.fileModifiedAt.getTime() : Date.parse(state?.fileModifiedAt);
+  if (!Number.isSafeInteger(state?.fileSize) || state.fileSize <= 0 || !Number.isFinite(modified)) return void 0;
+  return { size: state.fileSize, sourceModifiedAt: new Date(modified).toISOString() };
+}
+async function runFeedPass(deps, { force = false, allowMediaWrites = false, limits = {} } = {}) {
+  for (const name of ["acquireLock", "releaseLock", "getState", "saveState", "logRun", "runFeed"]) {
+    if (typeof deps?.[name] !== "function") throw new Error("FEED_PASS_DEPENDENCIES_INVALID");
+  }
+  const known = force ? void 0 : knownDelivery(await deps.getState());
+  const owner = await deps.acquireLock();
+  try {
+    const fed = await deps.runFeed({ allowMediaWrites, ...known ? { unchangedSince: known } : {} });
+    if (fed?.unchanged === true) return { status: "unchanged" };
+    const summary = fed.summary || {};
+    const warnings = {
+      ...Array.isArray(summary.heldListings) && summary.heldListings.length ? { heldListings: summary.heldListings } : {},
+      ...summary.omittedPhotos ? { omittedPhotos: summary.omittedPhotos } : {}
+    };
+    if (!fed.snapshot) {
+      const progress = {
+        status: "staging",
+        dryRun: false,
+        media: summary.media,
+        blocks: summary.blocks || [],
+        ...summary.heldListingCount ? { held: summary.heldListingCount } : {}
+      };
+      await deps.logRun(progress);
+      return progress;
+    }
+    const result = await synchronize({
+      ...deps,
+      // The lock is already held for the whole pass.
+      acquireLock: async () => owner,
+      releaseLock: async () => {
+      },
+      readSnapshot: async () => fed.snapshot,
+      saveState: (state) => deps.saveState({ ...state, ...deliveryIdentity(fed.source) })
+    }, { ...limits, dryRun: false });
+    return { ...result, ...warnings };
+  } finally {
+    await deps.releaseLock(owner);
+  }
+}
+
+// velo/backend/lib/job-alert.js
+var HOUR = 36e5;
+var DAY = 24 * HOUR;
+var text2 = (value) => typeof value === "string" ? value : "";
+var PATIENCE = /* @__PURE__ */ new Map([
+  ["SFTP_FILE_TOO_RECENT", 3],
+  // a deposit is in progress
+  ["LOCK_UNAVAILABLE_CHECK_CONTROL_COLLECTION", 2]
+  // a manual run may be going on
+]);
+var STAGING_PATIENCE = 12;
+var EXPLANATIONS = [
+  [/^SFTP_FILE_STALE$/, "La Boîte Immo n’a déposé aucun fichier depuis plus de 36 h. Le site garde les dernières annonces."],
+  [/^SFTP_HOST_KEY_REJECTED$/, "L’empreinte du serveur OVH a changé. L’import est arrêté par sécurité."],
+  [/^SFTP_SECRET_/, "Les identifiants SFTP sont absents ou invalides dans le gestionnaire de secrets Wix."],
+  [/^SFTP_FILE_TOO_RECENT$/, "Le fichier est en cours de dépôt depuis plusieurs passages."],
+  [/^SFTP_/, "La lecture du fichier sur OVH échoue."],
+  [/^LOCK_/, "Un verrou d’import est resté en place. Vérifier qu’aucun import ne tourne, puis supprimer « import-lock » dans HektorSyncControl."],
+  [/^(?:ZIP|POLIRIS|EXPORT|SOURCE)_/, "Le fichier reçu n’a pas le format attendu."],
+  [/^(?:STALE|FUTURE)_SNAPSHOT$/, "La date du fichier reçu est incohérente."],
+  [/^MEDIA_/, "Une photo bloque l’import."]
+];
+var explain = (code) => EXPLANATIONS.find(([pattern]) => pattern.test(code))?.[1] || "L’import a échoué.";
+function fingerprint(values) {
+  let hash2 = 0;
+  for (const character of values.join("|")) hash2 = hash2 * 31 + character.charCodeAt(0) >>> 0;
+  return hash2.toString(16);
+}
+function classifyOutcome(outcome, streak = 1) {
+  const status = text2(outcome?.status);
+  const ok = { level: "ok", key: "", patience: 1, title: "", body: "" };
+  if (status === "failed") {
+    const code = /^[A-Z][A-Z0-9_]{2,63}$/.test(text2(outcome.code)) ? outcome.code : "HEKTOR_JOB_FAILED";
+    return {
+      level: "problem",
+      key: `failed:${code}`,
+      patience: PATIENCE.get(code) || 1,
+      title: "Import Hektor en échec",
+      body: `${explain(code)} Code : ${code}.`
+    };
+  }
+  if (status === "blocked") {
+    const blocks = (Array.isArray(outcome.blocks) ? outcome.blocks : []).map(text2).filter(Boolean).sort();
+    const removals = blocks.some((block) => ["EXCESSIVE_REMOVALS", "EMPTY_PUBLIC_CATALOG"].includes(block));
+    return {
+      level: "problem",
+      key: `blocked:${blocks.join("+")}`,
+      patience: 1,
+      title: "Import Hektor suspendu",
+      body: `${removals ? "Le fichier retire beaucoup d’annonces d’un coup. Vérifier avec l’agence, puis approuver avec approveRemovalsAndApply." : "Le plan d’import est bloqué."} Blocage : ${blocks.join(", ") || "inconnu"}.`
+    };
+  }
+  if (status === "staging") {
+    const blocks = (Array.isArray(outcome.blocks) ? outcome.blocks : []).map(text2);
+    if (blocks.includes("MEDIA_RECOVERY_REQUIRED")) {
+      return {
+        level: "problem",
+        key: "staging:MEDIA_RECOVERY_REQUIRED",
+        patience: 2,
+        title: "Import Hektor : photo à vérifier",
+        body: "Un import de photo est resté sans réponse. Les annonces ne sont plus mises à jour tant qu’il n’est pas résolu. Code : MEDIA_RECOVERY_REQUIRED."
+      };
+    }
+    if (streak >= STAGING_PATIENCE) {
+      return {
+        level: "problem",
+        key: "staging:slow",
+        patience: STAGING_PATIENCE,
+        title: "Import Hektor : photos en attente",
+        body: `Les photos ne sont toujours pas toutes importées après ${streak} passages.`
+      };
+    }
+    return { ...ok, key: "staging:progress", level: "progress" };
+  }
+  if (status === "applied") {
+    const held = (Array.isArray(outcome.heldListings) ? outcome.heldListings : []).map((item) => `${text2(item?.reference)}:${text2(item?.code)}`).sort();
+    const omitted = Number.isSafeInteger(outcome.omittedPhotos) ? outcome.omittedPhotos : 0;
+    if (held.length || omitted) {
+      const parts = [
+        ...held.length ? [`${held.length} annonce${held.length > 1 ? "s" : ""} en quarantaine (${held.slice(0, 5).join(", ")}${held.length > 5 ? "…" : ""})`] : [],
+        ...omitted ? [`${omitted} photo${omitted > 1 ? "s" : ""} refusée${omitted > 1 ? "s" : ""} par Wix`] : []
+      ];
+      return {
+        level: "warning",
+        key: `warning:${fingerprint([...held, String(omitted)])}`,
+        patience: 1,
+        title: "Import Hektor : à corriger dans Hektor",
+        body: `Import appliqué, mais ${parts.join(" et ")}.`
+      };
+    }
+  }
+  return ok;
+}
+function decideAlert(previous, outcome, now) {
+  const before = previous && typeof previous === "object" ? previous : {};
+  const first = classifyOutcome(outcome);
+  const streak = first.key && before.problemKey === first.key ? (Number(before.streak) || 0) + 1 : first.key === "staging:progress" && /^staging:/.test(text2(before.problemKey)) ? (Number(before.streak) || 0) + 1 : first.key ? 1 : 0;
+  const state = classifyOutcome(outcome, streak);
+  const open = { alertedKey: text2(before.alertedKey), alertedAt: text2(before.alertedAt), alertedLevel: text2(before.alertedLevel) };
+  const standing = text2(outcome?.status) === "unchanged" && open.alertedLevel === "warning";
+  let alert = null;
+  if (state.level === "problem" || state.level === "warning") {
+    const repeatAfter = state.level === "warning" ? 7 * DAY : DAY;
+    const last = Date.parse(open.alertedAt);
+    const due = open.alertedKey !== state.key || !Number.isFinite(last) || now - last >= repeatAfter;
+    if (streak >= state.patience && due) {
+      alert = { title: state.title, body: state.body };
+      Object.assign(open, { alertedKey: state.key, alertedAt: new Date(now).toISOString(), alertedLevel: state.level });
+    }
+  } else if (state.level === "ok" && !standing) {
+    if (open.alertedKey && open.alertedLevel === "problem") {
+      alert = { title: "Import Hektor rétabli", body: "L’import fonctionne de nouveau." };
+    }
+    Object.assign(open, { alertedKey: "", alertedAt: "", alertedLevel: "" });
+  }
+  return {
+    alert,
+    heartbeat: {
+      lastRunAt: new Date(now).toISOString(),
+      lastStatus: text2(outcome?.status),
+      lastCode: text2(outcome?.code),
+      problemKey: standing ? text2(before.problemKey) : state.key,
+      streak: standing ? Number(before.streak) || 0 : streak,
+      ...state.level === "ok" ? { lastOkAt: new Date(now).toISOString() } : before.lastOkAt ? { lastOkAt: text2(before.lastOkAt) } : {},
+      ...open
+    }
+  };
+}
+
+// velo/backend/hektor-alert.js
+import { notifications } from "wix-crm-backend";
+async function notifyOperators({ title, body }, settings4) {
+  await notifications.notify(String(body).slice(0, 500), [...settings4.channels], {
+    title: String(title).slice(0, 80),
+    actionTitle: "Ouvrir le CMS",
+    actionTarget: { url: settings4.actionUrl },
+    recipients: { role: settings4.recipientsRole }
+  });
+}
+
 // velo/backend/hektor-sync.js
 var READ = { suppressAuth: true, consistentRead: true };
 var WRITE = { suppressAuth: true };
@@ -3217,18 +3617,15 @@ var idFor = (sourceId) => {
 };
 function sftpIngest() {
   return createHektorIngest(HEKTOR, {
-    async readSource(config) {
+    async readSource(config, options) {
       const started = Date.now();
       console.info("HEKTOR_SFTP_START");
       const source = await readHektorSftp(config, {
         createClient: () => new SftpClient("hektor"),
-        readSecret: secretValue
+        readSecret: secretValue,
+        ...options?.unchangedSince ? { unchangedSince: options.unchangedSince } : {}
       });
-      console.info("HEKTOR_SFTP_READ_OK", JSON.stringify({
-        elapsedMs: Date.now() - started,
-        archiveSha256: source.context.rawSha256,
-        bytes: source.bytes.length
-      }));
+      console.info("HEKTOR_SFTP_READ_OK", JSON.stringify(source.unchanged === true ? { elapsedMs: Date.now() - started, unchanged: true } : { elapsedMs: Date.now() - started, archiveSha256: source.context.rawSha256, bytes: source.bytes.length }));
       return source;
     },
     prepareArchive: createPolirisArchiveParser(yauzl),
@@ -3367,6 +3764,36 @@ async function readHektorExportReport() {
     csv
   };
 }
+var mediaWritesAllowed = (runtime) => HEKTOR.mediaPreparationEnabled === true && runtime?.staging === true;
+var saveState = (state) => wixData2.save(HEKTOR.controlCollection, { _id: stateId, ...state }, WRITE);
+function publicStore() {
+  return {
+    hash,
+    idFor,
+    logRun,
+    getState: () => oneControl(stateId),
+    async listPublic() {
+      const result = await wixData2.query(HEKTOR.publicCollection).eq("source", publicSource).limit(HEKTOR.maxItems + 1).find(READ);
+      if (result.items.length > HEKTOR.maxItems) throw new Error("COLLECTION_TOO_LARGE");
+      return result.items;
+    },
+    // Location's PUBLISH plugin defaults to PUBLISHED: this is a public write,
+    // not a sandbox import. Only enabled + validated acceptance permits it.
+    async saveManyPublic(records) {
+      for (let start = 0; start < records.length; start += 50) {
+        const chunk = records.slice(start, start + 50);
+        const result = await wixData2.bulkSave(HEKTOR.publicCollection, chunk, WRITE);
+        if (!result || Array.isArray(result.errors) && result.errors.length || (result.inserted || 0) + (result.updated || 0) + (result.skipped || 0) !== chunk.length) {
+          throw new Error("SYNC_BULK_SAVE_INCOMPLETE");
+        }
+      }
+    },
+    async removeManyPublic(ids) {
+      const result = await wixData2.bulkRemove(HEKTOR.publicCollection, ids, WRITE);
+      if (!result || Array.isArray(result.errors) && result.errors.length) throw new Error("SYNC_BULK_REMOVE_INCOMPLETE");
+    }
+  };
+}
 async function stageHektorFeedMedia() {
   if (HEKTOR.mediaPreparationEnabled !== true) throw new Error("HEKTOR_MEDIA_PREPARATION_DISABLED");
   if (!(await readRuntimeSwitch()).staging) throw new Error("HEKTOR_MEDIA_STAGING_SWITCHED_OFF");
@@ -3379,39 +3806,37 @@ async function stageHektorFeedMedia() {
 }
 async function runHektorSync({ dryRun = true, approvedRemovalFingerprint = "" } = {}) {
   if (!dryRun && !HEKTOR.enabled) throw new Error("HEKTOR_SYNC_DISABLED");
-  if (!dryRun && !(await readRuntimeSwitch()).sync) throw new Error("HEKTOR_SYNC_SWITCHED_OFF");
+  const runtime = dryRun ? null : await readRuntimeSwitch();
+  if (!dryRun && !runtime.sync) throw new Error("HEKTOR_SYNC_SWITCHED_OFF");
   if (typeof approvedRemovalFingerprint !== "string" || approvedRemovalFingerprint && !/^[a-f0-9]{64}$/.test(approvedRemovalFingerprint)) throw new Error("INVALID_APPROVAL");
   let preview;
   if (dryRun && HEKTOR.sourceMode === "sftp") {
     preview = await sftpIngest().previewSnapshot();
     if (!preview.snapshot) return { ...preview.summary, dryRun: true, status: "blocked" };
   }
+  let source;
   return synchronize({
-    hash,
-    idFor,
+    ...publicStore(),
     acquireLock,
     releaseLock,
-    readSnapshot: () => preview ? preview.snapshot : readSnapshot({ dryRun }),
-    getState: () => oneControl(stateId),
-    async listPublic() {
-      const result = await wixData2.query(HEKTOR.publicCollection).eq("source", publicSource).limit(HEKTOR.maxItems + 1).find(READ);
-      if (result.items.length > HEKTOR.maxItems) throw new Error("COLLECTION_TOO_LARGE");
-      return result.items;
+    async readSnapshot() {
+      if (preview) return preview.snapshot;
+      if (HEKTOR.sourceMode !== "sftp") return readSnapshot({ dryRun });
+      const fed = await sftpIngest().runFeed({ allowMediaWrites: mediaWritesAllowed(runtime) });
+      if (!fed.snapshot) throw new Error("HEKTOR_MEDIA_NOT_READY");
+      source = fed.source;
+      return fed.snapshot;
     },
-    // Location's PUBLISH plugin defaults to PUBLISHED: this is a public write,
-    // not a sandbox import. Only enabled + validated acceptance permits it.
-    savePublic: (record) => wixData2.save(HEKTOR.publicCollection, record, WRITE),
-    removePublic: (id) => wixData2.remove(HEKTOR.publicCollection, id, WRITE),
-    saveState: (state) => wixData2.save(HEKTOR.controlCollection, { _id: stateId, ...state }, WRITE),
-    logRun
+    saveState: (state) => saveState({ ...state, ...deliveryIdentity(source) })
   }, { ...HEKTOR, dryRun, approvedRemovalFingerprint });
 }
 async function readHektorSyncStatus() {
-  const [state, lock, runs, runtime] = await Promise.all([
+  const [state, lock, runs, runtime, heartbeat] = await Promise.all([
     oneControl(stateId),
     oneControl("import-lock"),
     (async () => wixData2.query(HEKTOR.runsCollection).descending("createdAt").limit(5).find(READ))(),
-    readRuntimeSwitch()
+    readRuntimeSwitch(),
+    oneControl(HEARTBEAT_ID)
   ]);
   return {
     enabled: HEKTOR.enabled,
@@ -3421,37 +3846,65 @@ async function readHektorSyncStatus() {
     mediaPreparationEnabled: HEKTOR.mediaPreparationEnabled,
     state,
     lock,
+    heartbeat,
     runs: runs.items
   };
 }
 var SAFE_CODE = /^(?:HEKTOR|SFTP|POLIRIS|ZIP|MEDIA|EXPORT|SOURCE|LOCK|SYNC|INVALID|OUT_OF_ORDER|SNAPSHOT|STALE|FUTURE)_[A-Z0-9_]+$/;
-async function runHektorJob() {
+var HEARTBEAT_ID = "heartbeat";
+async function recordHeartbeat(outcome) {
+  const previous = await oneControl(HEARTBEAT_ID);
+  const { heartbeat, alert } = decideAlert(previous, outcome, Date.now());
+  let alertError;
+  if (alert && HEKTOR.alerts?.enabled === true) {
+    try {
+      await notifyOperators(alert, HEKTOR.alerts);
+    } catch {
+      alertError = "ALERT_SEND_FAILED";
+      Object.assign(heartbeat, {
+        alertedKey: previous?.alertedKey || "",
+        alertedAt: previous?.alertedAt || "",
+        alertedLevel: previous?.alertedLevel || ""
+      });
+    }
+  }
+  await wixData2.save(HEKTOR.controlCollection, {
+    _id: HEARTBEAT_ID,
+    ...heartbeat,
+    ...alertError ? { alertError } : {}
+  }, WRITE);
+}
+async function runHektorJob({ manual = false } = {}) {
   const runtime = await readRuntimeSwitch();
   if (!HEKTOR.enabled || !runtime.sync) return { status: "switched-off" };
+  let outcome;
   try {
-    if (HEKTOR.mediaPreparationEnabled && runtime.staging) {
-      const staged = await stageHektorFeedMedia();
-      if (staged.status !== "prepared") {
-        const progress = {
-          status: "staging",
-          dryRun: false,
-          media: staged.media,
-          blocks: staged.blocks,
-          ...staged.heldListingCount ? { held: staged.heldListingCount } : {}
-        };
-        await logRun(progress);
-        return progress;
-      }
-    }
-    return await runHektorSync({ dryRun: false });
+    outcome = await runFeedPass({
+      ...publicStore(),
+      acquireLock,
+      releaseLock,
+      saveState,
+      runFeed: (options) => sftpIngest().runFeed(options)
+    }, { force: manual, allowMediaWrites: mediaWritesAllowed(runtime), limits: HEKTOR });
   } catch (error) {
     const code = SAFE_CODE.test(error?.message || "") ? error.message : "HEKTOR_JOB_FAILED";
     if (!["SYNC_FAILED", "OUT_OF_ORDER_SNAPSHOT", "SNAPSHOT_CONFLICT"].includes(error?.message)) {
       await logRun({ status: "failed", code, dryRun: false }).catch(() => {
       });
     }
-    throw new Error(code);
+    outcome = { status: "failed", code };
   }
+  if (!manual) await recordHeartbeat(outcome).catch(() => console.error("HEKTOR_HEARTBEAT_FAILED"));
+  if (outcome.status === "failed") throw new Error(outcome.code);
+  return outcome;
+}
+async function sendOperatorTestAlert() {
+  if (HEKTOR.alerts?.enabled !== true) return { status: "disabled" };
+  await notifyOperators({
+    title: "Test d’alerte de l’import Hektor",
+    body: "Ce message confirme que les alertes de l’import Hektor arrivent bien."
+  }, HEKTOR.alerts);
+  return { status: "sent", channels: [...HEKTOR.alerts.channels], recipientsRole: HEKTOR.alerts.recipientsRole };
 }
 
 // scripts/probes/hektor-integration.entry.js
@@ -3524,12 +3977,19 @@ async function integrationInspect() {
 async function integrationStatus() {
   return safe(readHektorSyncStatus);
 }
-async function integrationApproveRemovals(fingerprint) {
+async function integrationApproveRemovals(fingerprint2) {
   if (!HEKTOR.enabled) return { status: "disabled", code: "HEKTOR_SYNC_DISABLED" };
-  if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+  if (typeof fingerprint2 !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint2)) {
     return { status: "blocked", code: "INVALID_APPROVAL" };
   }
-  return prerequisiteBlock() || safe(() => runHektorSync({ dryRun: false, approvedRemovalFingerprint: fingerprint }));
+  return prerequisiteBlock() || safe(() => runHektorSync({ dryRun: false, approvedRemovalFingerprint: fingerprint2 }));
+}
+async function integrationRunImport() {
+  if (!HEKTOR.enabled) return { status: "disabled", code: "HEKTOR_SYNC_DISABLED" };
+  return prerequisiteBlock() || safe(() => runHektorJob({ manual: true }));
+}
+async function integrationTestAlert() {
+  return safe(sendOperatorTestAlert);
 }
 async function syncHektorHourly() {
   const result = await runHektorJob();
@@ -3551,7 +4011,9 @@ export {
   integrationPrepare,
   integrationPreview,
   integrationReadiness,
+  integrationRunImport,
   integrationStage,
   integrationStatus,
+  integrationTestAlert,
   syncHektorHourly
 };
