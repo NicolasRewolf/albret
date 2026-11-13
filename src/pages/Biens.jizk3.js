@@ -68,8 +68,6 @@ function galleryFor(item) {
   const cover = imageSource(item.cover);
   if (cover) {
     const original = entries.find(entry => imageIdentity(entry.src) === imageIdentity(cover));
-    // Le champ IMAGE peut revenir en HTTPS alors que la galerie conserve
-    // l'identifiant Wix natif et ses dimensions pour cette même photo.
     const source = original?.src.startsWith('wix:image://') ? original.src : cover;
     entries.unshift({ type: 'image', src: source, title: original?.title || text(item.title),
       description: original?.description || '' });
@@ -145,7 +143,6 @@ const COMFORT = [
   ['slopingLand', 'Terrain en pente', boolean], ['waterFeature', 'Plan d’eau', boolean],
   ['servicedLand', 'Terrain viabilisé', boolean],
 ];
-// A garage keeps supplied access, parking, construction and security facts, not residential cards.
 const GARAGE_KEYS = new Set(['area', 'landArea', 'propertyTypeLabel', 'propertySubtype', 'neighborhood',
   'floor', 'totalFloors', 'constructionYear', 'parkingSpaces', 'garageSpaces', 'availableFrom',
   'heatingLabel', 'renovated', 'recent', 'needsRenovation', 'elevator', 'digicode', 'intercom',
@@ -159,6 +156,7 @@ function metricsFor(source, garage) {
     ['area', 'Surface', positiveArea], ['rooms', 'Pièces', positiveInteger],
     ['bedrooms', 'Chambres', positiveInteger], ['terraceArea', 'Terrasse', positiveArea],
     ['bathrooms', source.bathrooms === 1 ? 'Salle de bains' : 'Salles de bains', positiveInteger],
+    ['showerRooms', source.showerRooms === 1 ? 'Salle d’eau' : 'Salles d’eau', positiveInteger],
     ['floor', 'Étage', floor],
   ];
   const heroKeys = new Set(garage ? ['area', 'garageSpaces', 'parkingSpaces'] : ['area', 'rooms', 'bedrooms']);
@@ -240,7 +238,11 @@ const CO_OWNERSHIP = [
   ['coOwnershipProcedureDetails', 'Détails de la procédure'],
 ];
 
-function financialFor(details, transaction, garage) {
+function financialFor(details, transaction, garage, soldListing) {
+  if (soldListing) {
+    return { financialRows: [], financialNotes: [], feesShort: '', feeScheduleUrl: '',
+      financialHeading: 'Informations financières' };
+  }
   const definitions = transaction === 'sale' ? SALE_FINANCIAL : transaction === 'rent' ? RENT_FINANCIAL : [];
   const excluded = new Set();
   if (garage || details.rentControlled === false) {
@@ -277,14 +279,16 @@ function rentalFor(item, details, transaction, financialRows) {
   const detail = (key, label, format = money) => {
     if (knownRows.has(key)) add(key, label, format(details[key]));
   };
-  detail('baseRent', 'Loyer de base hors charges', monthly);
-  detail('referenceRent', 'Loyer de référence majoré', monthly);
-  detail('rentSupplement', 'Complément de loyer', monthly);
 
-  // Le loyer n'est qualifié que si le flux le dit : charges comprises, hors
-  // charges, ou ni l'un ni l'autre (locations professionnelles).
+  // 1. Loyer principal, loyer hors charges et charges en tête pour une lecture immédiate
   const chargesIncluded = details.rentChargesIncluded === true;
   const monthlyCharges = ['monthly_flat', 'monthly_provision_annual_adjustment'].includes(details.chargeTerms);
+  if (finite(item.price)) {
+    add('totalRent', chargesIncluded ? 'Loyer charges comprises' : details.rentChargesIncluded === false
+      ? 'Loyer hors charges' : 'Loyer', monthly(item.price));
+  } else if (text(item.priceLabel)) {
+    add('totalRent', 'Loyer affiché', text(item.priceLabel));
+  }
   if (chargesIncluded && finite(item.price) && finite(details.rentCharges) && monthlyCharges
       && item.price >= details.rentCharges) {
     const excludingCharges = Math.round((item.price - details.rentCharges) * 100) / 100;
@@ -299,20 +303,20 @@ function rentalFor(item, details, transaction, financialRows) {
     annual_reimbursement: 'Charges remboursées annuellement',
   };
   detail('rentCharges', chargeLabels[details.chargeTerms] || 'Charges locataire', monthlyCharges ? monthly : money);
-  if (finite(item.price)) {
-    add('totalRent', chargesIncluded ? 'Loyer charges comprises' : details.rentChargesIncluded === false
-      ? 'Loyer hors charges' : 'Loyer', monthly(item.price));
-  } else if (text(item.priceLabel)) {
-    add('totalRent', 'Loyer affiché', text(item.priceLabel));
-  }
+
+  // 2. Dépôt de garantie et honoraires locataire
   detail('deposit', 'Dépôt de garantie');
   detail('rentalFees', 'Honoraires TTC à la charge du locataire');
   detail('inventoryFees', 'Dont honoraires TTC pour l’état des lieux');
+
+  // 3. Encadrement des loyers regroupé
   detail('rentControlled', 'Encadrement des loyers', boolean);
+  detail('baseRent', 'Loyer de base hors charges', monthly);
+  detail('referenceRent', 'Loyer de référence majoré', monthly);
+  detail('rentSupplement', 'Complément de loyer', monthly);
 
   const handled = new Set(['baseRent', 'referenceRent', 'rentSupplement', 'rentCharges', 'chargeTerms',
     'deposit', 'rentalFees', 'inventoryFees', 'rentControlled']);
-  // L'indicateur CC vrai est déjà exprimé dans le libellé du montant total.
   if (chargesIncluded && finite(item.price)) handled.add('rentChargesIncluded');
   const annualFormats = { annualRent: annual, annualCharges: annual,
     annualRentPerSquareMeter: annualArea, annualChargesPerSquareMeter: annualArea,
@@ -330,10 +334,29 @@ function rentalFor(item, details, transaction, financialRows) {
   return { rentalRows, rentalNotes };
 }
 
+const ENERGY_LEGAL_PATTERNS = [
+  /^Classe énergie\s*:/,
+  /^Classe GES\s*:/,
+  /^Consommation d’énergie primaire\s*:/,
+  /^Émissions de gaz à effet de serre\s*:/,
+  /^Date de réalisation du DPE\s*:/,
+  /^Version du DPE\s*:/,
+  /^Estimation (?:basse|haute|annuelle) des dépenses énergétiques annuelles/,
+  /^Date de référence des prix de l’énergie\s*:/,
+];
+
+function stripRedundantLegalLines(rawText, view) {
+  return text(rawText).split('\n').filter(rawLine => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1).trim() : rawLine.trim();
+    if (!line || line.includes('0000-00-00')) return false;
+    if (view.energy.visible && ENERGY_LEGAL_PATTERNS.some(pattern => pattern.test(line))) return false;
+    return true;
+  }).join('\n');
+}
+
 function rentalLegalTextFor(item, details, view) {
-  if (item.source !== 'hektor' || view.transaction !== 'rent') return view.legalText;
-  // Correspondances exactes de disclosure() dans hektor-xml.js. Une mention
-  // différente, libre ou sans représentation visible reste conservée.
+  const baseText = stripRedundantLegalLines(view.legalText, view);
+  if (item.source !== 'hektor' || view.transaction !== 'rent') return baseText;
   const yesNo = value => value === true ? 'oui' : value === false ? 'non' : '';
   const count = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : '';
   const definitions = [
@@ -385,38 +408,37 @@ function rentalLegalTextFor(item, details, view) {
   if (text(details.financialConditions) && view.rentalNotes.includes(text(details.financialConditions))) {
     remember('Conditions financières', details.financialConditions);
   }
-  return view.legalText.split('\n').filter(line => !repeated.has(line.endsWith('\r') ? line.slice(0, -1) : line)).join('\n');
+  return baseText.split('\n').filter(line => !repeated.has(line.trim())).join('\n');
 }
 
-/**
- * Native presentation contract. A renderer must collapse the complete wrapper
- * named by visibility, including static headings, and replace repeater arrays.
- * Empty strings/arrays clear the preceding listing. Unknown fields are ignored.
- */
 function buildListingView(input) {
   const item = object(input);
   const details = object(item.publicDetails);
   const variant = variantFor(item, details);
   const garage = variant === 'garage';
   const transaction = ['sale', 'rent'].includes(item.transaction) ? item.transaction : '';
-  const soldPublicListing = item.source === 'site-public' && details.commercialStatus === 'sold' && transaction === 'sale';
+  const soldListing = ['site-public', 'hektor'].includes(item.source) && details.commercialStatus === 'sold' && transaction === 'sale';
   const propertyTypeLabel = text(item.propertyTypeLabel) || (garage ? 'Garage / parking' : enumValue(TYPE_LABELS)(item.propertyType));
   const source = { ...details, area: item.area, rooms: item.rooms, bedrooms: item.bedrooms, propertyTypeLabel };
   const applicable = definitions => garage ? definitions.filter(([key]) => GARAGE_KEYS.has(key)) : definitions;
   const surfaces = rows(source, applicable(SURFACES));
   const layout = rows(source, applicable(LAYOUT));
   const comfort = rows(source, applicable(COMFORT));
-  const financial = financialFor(details, transaction, garage);
+  const energy = energyFor(item, details);
+  const financial = financialFor(details, transaction, garage, soldListing);
   const view = {
-    title: text(item.title), city: cityLabel(item), priceLabel: text(item.priceLabel),
-    description: text(item.description), reference: text(item.reference), legalText: text(item.legalText),
+    title: text(item.title), city: cityLabel(item),
+    priceLabel: soldListing ? 'Vendu' : text(item.priceLabel),
+    description: text(item.description), reference: text(item.reference),
+    legalText: text(item.legalText),
     variant, transaction, propertyTypeLabel,
-    transactionTypeLabel: soldPublicListing ? ['Vendu', propertyTypeLabel].filter(Boolean).join(' — ')
+    transactionTypeLabel: soldListing ? ['Vendu', propertyTypeLabel].filter(Boolean).join(' — ')
       : [transaction === 'sale' ? 'À vendre' : transaction === 'rent' ? 'À louer' : '', propertyTypeLabel].filter(Boolean).join(' · '),
     gallery: galleryFor(item), ...metricsFor(source, garage), surfaces, layout, comfort,
-    energy: energyFor(item, details), ...financial,
+    energy, ...financial,
     ...rentalFor(item, details, transaction, financial.financialRows),
   };
+  view.cleanSaleLegalText = stripRedundantLegalLines(view.legalText, view);
   view.rentalLegalText = rentalLegalTextFor(item, details, view);
   view.visibility = Object.fromEntries(['title', 'city', 'priceLabel', 'transactionTypeLabel', 'description',
     'reference', 'legalText', 'gallery', 'heroMetrics', 'quickFacts', 'surfaces', 'layout', 'comfort',
@@ -427,25 +449,22 @@ function buildListingView(input) {
     dpe: view.energy.dpe.visible, ges: view.energy.ges.visible, energyScale: view.energy.dpe.showScale,
     gesScale: view.energy.ges.showScale, energyEstimate: Boolean(view.energy.annualRange),
     energyDate: Boolean(view.energy.date), energyReference: Boolean(view.energy.reference),
-    financial: Boolean(view.financialRows.length || view.financialNotes.length || view.feeScheduleUrl || view.feesShort),
+    financial: !soldListing && Boolean(view.financialRows.length || view.financialNotes.length || view.feeScheduleUrl || view.feesShort),
     rental: transaction === 'rent' && Boolean(view.rentalRows.length || view.rentalNotes.length || view.feeScheduleUrl),
   });
   view.visibility.energyFinance = view.visibility.energy || view.visibility.financial || view.visibility.rental;
   return view;
 }
 
-// Adaptateur de la fiche Biens dessinée le 28/10/2026.
-// Lecture seule du dataset. Les ID correspondent au montage Studio observé.
-// Bundler buildListingView avant de copier ce fichier dans le code de page Wix.
+const BATHROOM_ICON = "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"100 -860 760 760\" width=\"24\" viewBox=\"100 -860 760 760\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M385.23-254.77q10.15-10.15 10.15-25.23t-10.15-25.23T360-315.38t-25.23 10.15T324.62-280t10.15 25.23T360-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-315.38t-25.23 10.15T444.62-280t10.15 25.23T480-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-315.38t-25.23 10.15T564.62-280t10.15 25.23T600-244.62t25.23-10.15m-240-120q10.15-10.15 10.15-25.23t-10.15-25.23T360-435.38t-25.23 10.15T324.62-400t10.15 25.23T360-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-435.38t-25.23 10.15T444.62-400t10.15 25.23T480-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-435.38t-25.23 10.15T564.62-400t10.15 25.23T600-364.62t25.23-10.15M292.31-492.31h375.38V-520q0-77.61-55.04-132.65T480-707.69t-132.65 55.04T292.31-520zM342-540q8-51 46.5-85.5T480-660t91.5 34.5T618-540zM172.31-100Q142-100 121-121t-21-51.31v-615.38Q100-818 121-839t51.31-21h615.38Q818-860 839-839t21 51.31v615.38Q860-142 839-121t-51.31 21zm0-60h615.38q4.62 0 8.46-3.85 3.85-3.84 3.85-8.46v-615.38q0-4.62-3.85-8.46-3.84-3.85-8.46-3.85H172.31q-4.62 0-8.46 3.85-3.85 3.84-3.85 8.46v615.38q0 4.62 3.85 8.46 3.84 3.85 8.46 3.85M160-160v-640z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n";
 
-// SVG relevés dans le design Studio ; tracés, couleurs et viewBox conservés.
-// Étage : seul complément, issu de assets/ui-icons/etage-stairs.svg (Apache-2.0).
 const DESIGN_METRIC_ICONS = Object.freeze({
   "area": "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"220 -740 520 520\" width=\"24\" viewBox=\"220 -740 520 520\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M220-220v-220h60v160h160v60zm460-300v-160H520v-60h220v220z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n",
   "rooms": "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"140 -820 680 680\" width=\"24\" viewBox=\"140 -820 680 680\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M530-600v-220h290v220zM140-460v-360h290v360zm390 320v-360h290v360zm-390 0v-220h290v220zm60-380h170v-240H200zm390 320h170v-240H590zm0-460h170v-100H590zM200-200h170v-100H200zm170-100\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n",
   "bedrooms": "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"100 -720 760 500\" width=\"24\" viewBox=\"100 -720 760 500\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M100-220v-220q0-22.38 10.62-43.42Q121.23-504.46 140-518v-102q0-41.92 29.04-70.96T240-720h170q21.85 0 39.15 8.5Q466.46-703 480-688q13.54-15 30.85-23.5 17.3-8.5 39.15-8.5h170q41.92 0 70.96 29.04T820-620v102q18.77 13.54 29.38 34.58Q860-462.38 860-440v220h-60v-80H160v80zm410-320h250v-80q0-17-11.5-28.5T720-660H550q-17 0-28.5 11.5T510-620zm-310 0h250v-80q0-17-11.5-28.5T410-660H240q-17 0-28.5 11.5T200-620zm-40 180h640v-80q0-17-11.5-28.5T760-480H200q-17 0-28.5 11.5T160-440zm640 0H160z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n",
   "terraceArea": "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"140 -860 680 760\" width=\"24\" viewBox=\"140 -860 680 760\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M324.62-484.62v-70.76h70.76v70.76zm240 0v-70.76h70.76v70.76zM140-100v-291.54h40V-560q0-62.15 23.46-116.81 23.46-54.65 64.28-95.46 40.81-40.82 95.69-64.27Q418.31-860 480.23-860t116.58 23.46q54.65 23.46 95.46 64.27t64.27 95.46Q780-622.15 780-560v168.46h40V-100zm60-60h90v-171.54h-90zm150 0h100v-171.54H350zM240-391.54h210v-406.23q-85.61 9.38-147.81 75.88Q240-655.39 240-560zm270 0h210V-560q0-95.39-62.19-161.89-62.2-66.5-147.81-75.88zM510-160h100v-171.54H510zm160 0h90v-171.54h-90z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n",
-  "bathrooms": "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"100 -860 760 760\" width=\"24\" viewBox=\"100 -860 760 760\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M385.23-254.77q10.15-10.15 10.15-25.23t-10.15-25.23T360-315.38t-25.23 10.15T324.62-280t10.15 25.23T360-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-315.38t-25.23 10.15T444.62-280t10.15 25.23T480-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-315.38t-25.23 10.15T564.62-280t10.15 25.23T600-244.62t25.23-10.15m-240-120q10.15-10.15 10.15-25.23t-10.15-25.23T360-435.38t-25.23 10.15T324.62-400t10.15 25.23T360-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-435.38t-25.23 10.15T444.62-400t10.15 25.23T480-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-435.38t-25.23 10.15T564.62-400t10.15 25.23T600-364.62t25.23-10.15M292.31-492.31h375.38V-520q0-77.61-55.04-132.65T480-707.69t-132.65 55.04T292.31-520zM342-540q8-51 46.5-85.5T480-660t91.5 34.5T618-540zM172.31-100Q142-100 121-121t-21-51.31v-615.38Q100-818 121-839t51.31-21h615.38Q818-860 839-839t21 51.31v615.38Q860-142 839-121t-51.31 21zm0-60h615.38q4.62 0 8.46-3.85 3.85-3.84 3.85-8.46v-615.38q0-4.62-3.85-8.46-3.84-3.85-8.46-3.85H172.31q-4.62 0-8.46 3.85-3.85 3.84-3.85 8.46v615.38q0 4.62 3.85 8.46 3.84 3.85 8.46 3.85M160-160v-640z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n",
+  "bathrooms": BATHROOM_ICON,
+  "showerRooms": BATHROOM_ICON,
   "floor": "<svg fill=\"#B4361A\" xmlns=\"http://www.w3.org/2000/svg\" height=\"24\" viewBox=\"0 -960 960 960\" width=\"24\"><path d=\"M250-250h157v-133h103v-133h103v-134h97v-60H553v133H450v133H347v134h-97v60Zm-37.69 110Q182-140 161-161q-21-21-21-51.31v-535.38Q140-778 161-799q21-21 51.31-21h535.38Q778-820 799-799q21 21 21 51.31v535.38Q820-182 799-161q-21 21-51.31 21H212.31Zm0-60h535.38q4.62 0 8.46-3.85 3.85-3.84 3.85-8.46v-535.38q0-4.62-3.85-8.46-3.84-3.85-8.46-3.85H212.31q-4.62 0-8.46 3.85-3.85 3.84-3.85 8.46v535.38q0 4.62 3.85 8.46 3.84 3.85 8.46 3.85ZM200-760v560-560Z\"/></svg>"
 });
 
@@ -523,6 +542,7 @@ async function renderListingView(view) {
   };
   setText('#text10', view.title);
   setText('#text12', view.city);
+  setText('#text84', view.reference ? `Réf : ${view.reference}` : '');
   setText('#text13', view.priceLabel);
   setText('#text11', view.transactionTypeLabel);
   setText('#text14', view.feesShort);
@@ -583,7 +603,7 @@ async function renderListingView(view) {
   visible('#html1', false);
   visible('#box30', energy.visible);
 
-  const isSale = view.transaction === 'sale';
+  const isSale = view.transaction === 'sale' && view.visibility.financial;
   const isRental = view.transaction === 'rent';
   const finance = isSale ? view.financialRows.slice(0, 3) : [];
   const additionalFinance = isSale ? view.financialRows.slice(3) : [];
@@ -592,10 +612,9 @@ async function renderListingView(view) {
     setText(labelId, finance[index]?.label || '');
     setText(valueId, finance[index]?.value || '');
   });
-  const notes = isSale ? [...view.financialNotes, view.legalText, view.reference ? `Référence : ${view.reference}` : '']
-    .filter(Boolean).join('\n\n') : '';
+  const notes = isSale ? [...view.financialNotes, view.cleanSaleLegalText].filter(Boolean).join('\n\n') : '';
   const feeUrl = isSale ? safeWebUrl(view.feeScheduleUrl) : '';
-  const hasFinancial = Boolean(finance.length || additionalFinance.length || notes || feeUrl);
+  const hasFinancial = isSale && Boolean(finance.length || additionalFinance.length || notes || feeUrl);
   setText('#text65', hasFinancial ? view.transactionTypeLabel : '');
   setText('#text64', hasFinancial ? view.financialHeading : '');
   setHtml('#text68', financialNotesHtml(additionalFinance, notes));
@@ -605,10 +624,9 @@ async function renderListingView(view) {
     : '<p></p>');
   visible('#text69', Boolean(feeUrl));
   visible('#box38', Boolean(additionalFinance.length || notes || feeUrl));
-  visible('#achat', isSale && hasFinancial);
+  visible('#achat', hasFinancial);
 
-  const rentalNotes = isRental ? [...view.rentalNotes, view.rentalLegalText,
-    view.reference ? `Référence : ${view.reference}` : ''].filter(Boolean).join('\n\n') : '';
+  const rentalNotes = isRental ? [...view.rentalNotes, view.rentalLegalText].filter(Boolean).join('\n\n') : '';
   const rentalFeeUrl = isRental ? safeWebUrl(view.feeScheduleUrl) : '';
   const hasRental = isRental && Boolean(view.rentalRows.length || rentalNotes || rentalFeeUrl);
   setText('#text79', hasRental ? view.transactionTypeLabel : '');
@@ -652,7 +670,6 @@ function setDisplayed(id, displayed) {
   if (!displayed && typeof el.collapse === 'function') return el.collapse();
   if (displayed && typeof el.show === 'function') return el.show();
   if (!displayed && typeof el.hide === 'function') return el.hide();
-  console.warn(`[Albret/Biens] Élément introuvable ou sans expand/collapse : ${id}`);
   return Promise.resolve();
 }
 
