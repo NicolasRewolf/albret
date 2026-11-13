@@ -5,11 +5,16 @@ const text = value => typeof value === 'string' ? value.trim() : '';
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const number = value => finite(value) ? value.toLocaleString('fr-FR', { maximumFractionDigits: 2 }) : '';
+const moneyNumber = value => finite(value) ? value.toLocaleString('fr-FR', {
+  minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  maximumFractionDigits: 2,
+}) : '';
 const integer = value => Number.isSafeInteger(value) && value >= 0 ? number(value) : '';
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0 ? number(value) : '';
 const area = value => finite(value) ? `${number(value)} m²` : '';
 const positiveArea = value => finite(value) && value > 0 ? area(value) : '';
-const money = value => finite(value) ? `${number(value)} €` : '';
+const money = value => finite(value) ? `${moneyNumber(value)} €` : '';
+const legalMoney = value => finite(value) ? `${number(value)} €` : '';
 const boolean = value => value === true ? 'Oui' : value === false ? 'Non' : '';
 const floor = value => value === 0 ? 'RDC / RDJ' : integer(value);
 const year = value => Number.isSafeInteger(value) && value > 0 && value <= 9999 ? String(value) : '';
@@ -109,7 +114,8 @@ function rows(source, definitions, prefix = 'fact') {
 }
 
 const SURFACES = [
-  ['area', 'Surface', positiveArea], ['landArea', 'Surface du terrain', area],
+  ['area', 'Surface', positiveArea], ['boutinArea', 'Surface loi Boutin', positiveArea],
+  ['landArea', 'Surface du terrain', area],
   ['livingRoomArea', 'Surface du séjour', area], ['diningRoomArea', 'Surface de la salle à manger', area],
   ['balconyArea', 'Surface du balcon', area], ['terraceArea', 'Surface de la terrasse', area],
   ['cellarArea', 'Surface de la cave', area],
@@ -280,18 +286,23 @@ function rentalFor(item, details, transaction, financialRows) {
     if (knownRows.has(key)) add(key, label, format(details[key]));
   };
 
-  // 1. Loyer principal, loyer hors charges et charges en tête pour une lecture immédiate
+  // 1. Loyer principal, loyer hors charges et charges en tête
   const chargesIncluded = details.rentChargesIncluded === true;
   const monthlyCharges = ['monthly_flat', 'monthly_provision_annual_adjustment'].includes(details.chargeTerms);
+  let excludingCharges = undefined;
+  if (chargesIncluded && finite(item.price) && finite(details.rentCharges) && monthlyCharges
+      && item.price >= details.rentCharges) {
+    excludingCharges = Math.round((item.price - details.rentCharges) * 100) / 100;
+  } else if (!chargesIncluded && finite(item.price)) {
+    excludingCharges = Math.round(item.price * 100) / 100;
+  }
   if (finite(item.price)) {
     add('totalRent', chargesIncluded ? 'Loyer charges comprises' : details.rentChargesIncluded === false
       ? 'Loyer hors charges' : 'Loyer', monthly(item.price));
   } else if (text(item.priceLabel)) {
     add('totalRent', 'Loyer affiché', text(item.priceLabel));
   }
-  if (chargesIncluded && finite(item.price) && finite(details.rentCharges) && monthlyCharges
-      && item.price >= details.rentCharges) {
-    const excludingCharges = Math.round((item.price - details.rentCharges) * 100) / 100;
+  if (chargesIncluded && finite(excludingCharges)) {
     const coherentBase = !finite(details.baseRent) || details.baseRent <= excludingCharges;
     const coherentSupplement = !finite(details.baseRent) || !finite(details.rentSupplement)
       || Math.abs(details.baseRent + details.rentSupplement - excludingCharges) < 0.005;
@@ -309,11 +320,19 @@ function rentalFor(item, details, transaction, financialRows) {
   detail('rentalFees', 'Honoraires TTC à la charge du locataire');
   detail('inventoryFees', 'Dont honoraires TTC pour l’état des lieux');
 
-  // 3. Encadrement des loyers regroupé
+  // 3. Encadrement des loyers regroupé (avec calcul auto du complément de loyer si dépassé)
   detail('rentControlled', 'Encadrement des loyers', boolean);
   detail('baseRent', 'Loyer de base hors charges', monthly);
   detail('referenceRent', 'Loyer de référence majoré', monthly);
-  detail('rentSupplement', 'Complément de loyer', monthly);
+  let rentSupplement = finite(details.rentSupplement) && details.rentSupplement > 0 ? details.rentSupplement : undefined;
+  if (!finite(rentSupplement) && details.rentControlled === true
+      && finite(details.referenceRent) && details.referenceRent > 0
+      && finite(excludingCharges) && excludingCharges > details.referenceRent) {
+    rentSupplement = Math.round((excludingCharges - details.referenceRent) * 100) / 100;
+  }
+  if (finite(rentSupplement) && rentSupplement > 0) {
+    add('rentSupplement', 'Complément de loyer', monthly(rentSupplement));
+  }
 
   const handled = new Set(['baseRent', 'referenceRent', 'rentSupplement', 'rentCharges', 'chargeTerms',
     'deposit', 'rentalFees', 'inventoryFees', 'rentControlled']);
@@ -360,20 +379,20 @@ function rentalLegalTextFor(item, details, view) {
   const yesNo = value => value === true ? 'oui' : value === false ? 'non' : '';
   const count = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : '';
   const definitions = [
-    ['rentalFees', 'Honoraires TTC à la charge du locataire', money],
-    ['inventoryFees', 'Dont honoraires TTC pour l’état des lieux', money],
-    ['rentCharges', 'Montant des charges locataire transmis', money],
+    ['rentalFees', 'Honoraires TTC à la charge du locataire', legalMoney],
+    ['inventoryFees', 'Dont honoraires TTC pour l’état des lieux', legalMoney],
+    ['rentCharges', 'Montant des charges locataire transmis', legalMoney],
     ['rentChargesIncluded', 'Loyer charges comprises', yesNo],
     ['rentExcludingTax', 'Loyer hors taxes', yesNo],
-    ['baseRent', 'Loyer de base hors charges', money],
-    ['referenceRent', 'Loyer de référence majoré', money],
-    ['rentSupplement', 'Complément de loyer', money],
+    ['baseRent', 'Loyer de base hors charges', legalMoney],
+    ['referenceRent', 'Loyer de référence majoré', legalMoney],
+    ['rentSupplement', 'Complément de loyer', legalMoney],
     ['rentControlled', 'Soumis à l’encadrement des loyers', yesNo],
-    ['deposit', 'Dépôt de garantie', money],
-    ['annualRent', 'Loyer annuel global', money],
-    ['annualCharges', 'Charges annuelles globales', money],
-    ['annualRentPerSquareMeter', 'Loyer annuel au m²', money],
-    ['annualChargesPerSquareMeter', 'Charges annuelles au m²', money],
+    ['deposit', 'Dépôt de garantie', legalMoney],
+    ['annualRent', 'Loyer annuel global', legalMoney],
+    ['annualCharges', 'Charges annuelles globales', legalMoney],
+    ['annualRentPerSquareMeter', 'Loyer annuel au m²', legalMoney],
+    ['annualChargesPerSquareMeter', 'Charges annuelles au m²', legalMoney],
     ['monthlyChargesExcludingTax', 'Charges mensuelles hors taxes', yesNo],
     ['annualRentChargesIncluded', 'Loyer annuel charges comprises', yesNo],
     ['annualRentExcludingTax', 'Loyer annuel hors taxes', yesNo],
@@ -383,7 +402,7 @@ function rentalLegalTextFor(item, details, view) {
     ['annualChargesPerSquareMeterExcludingTax', 'Charges annuelles au m² hors taxes', yesNo],
     ['coOwnership', 'Bien en copropriété', yesNo],
     ['coOwnershipLots', 'Nombre de lots de copropriété', count],
-    ['coOwnershipAnnualCharges', 'Quote-part annuelle du budget prévisionnel de copropriété', money],
+    ['coOwnershipAnnualCharges', 'Quote-part annuelle du budget prévisionnel de copropriété', legalMoney],
     ['coOwnershipProcedure', 'Syndicat des copropriétaires en procédure', yesNo],
     ['coOwnershipProcedureDetails', 'Détails de la procédure', text],
   ];
@@ -419,7 +438,10 @@ function buildListingView(input) {
   const transaction = ['sale', 'rent'].includes(item.transaction) ? item.transaction : '';
   const soldListing = ['site-public', 'hektor'].includes(item.source) && details.commercialStatus === 'sold' && transaction === 'sale';
   const propertyTypeLabel = text(item.propertyTypeLabel) || (garage ? 'Garage / parking' : enumValue(TYPE_LABELS)(item.propertyType));
-  const source = { ...details, area: item.area, rooms: item.rooms, bedrooms: item.bedrooms, propertyTypeLabel };
+  const isResidentialRental = transaction === 'rent' && !garage && ['maison', 'appartement'].includes(item.propertyType);
+  const boutinArea = finite(details.boutinArea) && details.boutinArea > 0
+    ? details.boutinArea : (isResidentialRental && finite(item.area) && item.area > 0 ? item.area : undefined);
+  const source = { ...details, area: item.area, boutinArea, rooms: item.rooms, bedrooms: item.bedrooms, propertyTypeLabel };
   const applicable = definitions => garage ? definitions.filter(([key]) => GARAGE_KEYS.has(key)) : definitions;
   const surfaces = rows(source, applicable(SURFACES));
   const layout = rows(source, applicable(LAYOUT));
