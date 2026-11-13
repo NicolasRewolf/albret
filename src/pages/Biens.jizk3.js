@@ -241,7 +241,7 @@ function financialFor(details, transaction, garage) {
   if (garage) excluded.add('rentControlled');
   const coOwnership = CO_OWNERSHIP.filter(([key]) =>
     (details.coOwnership !== false || key === 'coOwnership') &&
-    (details.coOwnershipProcedure !== false || key !== 'coOwnershipProcedureDetails'));
+    (details.coOwnershipProcedure !== false || key === 'coOwnershipProcedureDetails'));
   const financialRows = rows(details, [...definitions.filter(([key]) => !excluded.has(key)), ...coOwnership], 'financial');
   const financialNotes = [text(details.financialConditions)].filter(Boolean);
   const feeScheduleUrl = url(details.feeScheduleUrl, ['http:', 'https:']);
@@ -472,11 +472,12 @@ $w.onReady(() => {
 });
 
 function renderRepeaterRow($item, row, config) {
-  if (config.label) $item(config.label).text = row.label;
+  if (!row || typeof row.value !== 'string') return;
+  if (config.label) $item(config.label).text = typeof row.label === 'string' ? row.label : '';
   $item(config.value).text = row.value;
   if (config.icon) {
     const icon = $item(config.icon);
-    const source = DESIGN_METRIC_ICONS[row._id.replace(/^(?:hero|metric)-/, '')];
+    const source = DESIGN_METRIC_ICONS[String(row._id || '').replace(/^(?:hero|metric)-/, '')];
     if (source) {
       icon.src = source;
       icon.expand();
@@ -505,9 +506,14 @@ async function renderListingView(view) {
 
   for (const config of REPEATERS) {
     const rows = view[config.key];
+    const byId = new Map(rows.map(row => [row._id, row]));
     $w(config.id).data = rows;
-    // Wix ne relance pas onItemReady pour les ID déjà présents au changement de bien.
-    $w(config.id).forEachItem(($item, row) => renderRepeaterRow($item, row, config));
+    // Wix ne relance pas onItemReady pour les ID déjà présents au changement de bien,
+    // et peut encore exposer les éléments modèles avant la fin de mise à jour de .data.
+    $w(config.id).forEachItem(($item, row) => {
+      const fresh = byId.get(row?._id);
+      if (fresh) renderRepeaterRow($item, fresh, config);
+    });
     visible(config.id, rows.length > 0);
     if (config.heading) visible(config.heading, rows.length > 0);
   }
