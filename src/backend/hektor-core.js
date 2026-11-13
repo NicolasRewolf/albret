@@ -2905,7 +2905,7 @@ function createMediaUrlCache({
     if (!lookupReceipt || !record.operationId || record.status === "failed") return record;
     const receipt = await call2(lookupReceipt, "MEDIA_RECEIPT_READ_FAILED", record.operationId);
     if (receipt === null) return record;
-    if (!object4(receipt) || receipt.operationId !== record.operationId || receipt.key !== identity2.key || receipt.sourceUrl !== identity2.sourceUrl || receipt.version !== identity2.version || !imageId(receipt.fileUrl) || record.fileUrl && record.fileUrl !== receipt.fileUrl) fail7("MEDIA_RECEIPT_CONFLICT");
+    if (!object4(receipt) || receipt.operationId !== record.operationId || receipt.key !== identity2.key || receipt.sourceUrl !== identity2.sourceUrl || receipt.version !== identity2.version || !imageId(receipt.fileUrl) || record.fileUrl && imageId(record.fileUrl) !== imageId(receipt.fileUrl)) fail7("MEDIA_RECEIPT_CONFLICT");
     if (["importing", "unresolved"].includes(record.status) || !record.fileUrl) {
       record = { ...record, fileUrl: receipt.fileUrl, status: "pending" };
       if (prepare) await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
@@ -2915,12 +2915,13 @@ function createMediaUrlCache({
   async function checked(record, identity2, prepare) {
     const { key } = identity2;
     const info = await call2(checkReady, "MEDIA_STATUS_CHECK_FAILED", record.fileUrl);
-    if (!object4(info) || info.fileUrl !== record.fileUrl || typeof info.opStatus !== "string" || !info.opStatus) fail7("MEDIA_INCOMPLETE_FILE_INFO");
+    if (!object4(info) || !imageId(info.fileUrl) || imageId(info.fileUrl) !== imageId(record.fileUrl) || typeof info.opStatus !== "string" || !info.opStatus) fail7("MEDIA_INCOMPLETE_FILE_INFO");
     if (info.opStatus === "FAILED") {
       if (prepare) await call2(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "failed" });
       return state(key, "failed");
     }
     if (info.opStatus !== "READY") return state(key, "pending");
+    if (info.fileUrl !== record.fileUrl) record = { ...record, fileUrl: info.fileUrl, status: record.status === "ready" ? "pending" : record.status };
     if (info.mediaType !== "image" || !MIME_TYPES3.has(info.mimeType) || info.isPrivate !== false || identity2.sourceMimeType && info.mimeType !== identity2.sourceMimeType || !Number.isSafeInteger(info.sizeInBytes) || info.sizeInBytes <= 0 || info.sizeInBytes > maxImageBytes || !Number.isSafeInteger(info.width) || info.width <= 0 || !Number.isSafeInteger(info.height) || info.height <= 0) fail7("MEDIA_INVALID_FILE_INFO");
     const url = await call2(resolvePublicUrl, "MEDIA_URL_RESOLUTION_FAILED", record.fileUrl);
     if (url !== `https://static.wixstatic.com/media/${imageId(record.fileUrl)}`) fail7("MEDIA_INVALID_PUBLIC_URL");
@@ -3153,7 +3154,8 @@ async function readMediaFileInfo(fileUrl, { getFileInfo, getFileDescriptor: getF
   const match = typeof fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s#]+(?:#[^\s]*)?$/.exec(fileUrl);
   if (!match) fail8("MEDIA_INVALID_FILE_URI");
   const info = await getFileInfo(fileUrl);
-  if (!object5(info) || info.fileUrl !== fileUrl) fail8("MEDIA_INCOMPLETE_FILE_INFO");
+  const answered = object5(info) && typeof info.fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\//.exec(info.fileUrl);
+  if (!answered || answered[1] !== match[1]) fail8("MEDIA_INCOMPLETE_FILE_INFO");
   if (info.opStatus !== void 0 && info.opStatus !== null) return { ...info, readinessSource: "legacy-op-status" };
   const descriptor = await getFileDescriptor2(match[1]);
   if (!object5(descriptor) || descriptor._id !== match[1] || typeof descriptor.operationStatus !== "string" || !descriptor.operationStatus) fail8("MEDIA_INCOMPLETE_FILE_DESCRIPTOR");
@@ -3348,8 +3350,12 @@ function createHektorMediaStore({
         hasFileUrl: Boolean(result?.fileUrl),
         status: result?.opStatus || "unknown",
         // Shape of the answer only (field names), to diagnose an answer without a file URL.
-        shape: result && typeof result === "object" ? Object.keys(result).slice(0, 20) : typeof result
+        hasFileName: Boolean(result?.fileName)
       }));
+      if (result && !result.fileUrl && typeof result.fileName === "string" && /^[A-Za-z0-9_~.\-]+$/.test(result.fileName)) {
+        const label = String(result.originalFileName || "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || "photo.jpg";
+        return { ...result, fileUrl: `wix:image://v1/${result.fileName}/${label}` };
+      }
       return result;
     },
     checkReady: readHektorMediaInfo,
