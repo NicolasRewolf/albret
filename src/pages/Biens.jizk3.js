@@ -115,7 +115,7 @@ function rows(source, definitions, prefix = 'fact') {
 
 const SURFACES = [
   ['area', 'Surface', positiveArea], ['boutinArea', 'Surface loi Boutin', positiveArea],
-  ['landArea', 'Surface du terrain', area],
+  ['carrezArea', 'Surface loi Carrez', positiveArea], ['landArea', 'Surface du terrain', area],
   ['livingRoomArea', 'Surface du séjour', area], ['diningRoomArea', 'Surface de la salle à manger', area],
   ['balconyArea', 'Surface du balcon', area], ['terraceArea', 'Surface de la terrasse', area],
   ['cellarArea', 'Surface de la cave', area],
@@ -124,7 +124,8 @@ const LAYOUT = [
   ['propertyTypeLabel', 'Type de bien'], ['propertySubtype', 'Type de bien précisé'],
   ['neighborhood', 'Quartier'], ['rooms', 'Pièces', integer], ['bedrooms', 'Chambres', integer],
   ['floor', 'Étage', floor], ['totalFloors', 'Étages de l’immeuble', integer],
-  ['constructionYear', 'Année de construction', year], ['bathrooms', 'Salles de bains', integer],
+  ['levels', 'Niveaux', positiveInteger], ['sharedWalls', 'Murs mitoyens'],
+  ['constructionYear', 'Année de construction', year], ['propertyTax', 'Taxe foncière annuelle', money], ['bathrooms', 'Salles de bains', integer],
   ['showerRooms', 'Salles d’eau', integer], ['toilets', 'WC', integer], ['balconies', 'Balcons', integer],
   ['terraces', 'Terrasses', integer], ['parkingSpaces', 'Places de parking', integer],
   ['garageSpaces', 'Places de garage', integer], ['kitchenLabel', 'Cuisine'],
@@ -141,7 +142,7 @@ const COMFORT = [
   ['digicode', 'Digicode', boolean], ['intercom', 'Interphone', boolean], ['caretaker', 'Gardien', boolean],
   ['alarm', 'Alarme', boolean], ['quiet', 'Calme', boolean], ['airConditioning', 'Climatisation', boolean],
   ['swimmingPool', 'Piscine', boolean], ['accessible', 'Aménagement pour handicapés', boolean],
-  ['fireplace', 'Cheminée', boolean], ['clearView', 'Vue dégagée', boolean],
+  ['fireplace', 'Cheminée', boolean], ['view', 'Vue'], ['clearView', 'Vue dégagée', boolean],
   ['overlooked', 'Vis-à-vis', boolean], ['exclusive', 'Exclusivité', boolean], ['featured', 'Coup de cœur', boolean],
   ['southFacing', 'Exposition sud', boolean], ['eastFacing', 'Exposition est', boolean],
   ['westFacing', 'Exposition ouest', boolean], ['northFacing', 'Exposition nord', boolean],
@@ -441,7 +442,9 @@ function buildListingView(input) {
   const isResidentialRental = transaction === 'rent' && !garage && ['maison', 'appartement'].includes(item.propertyType);
   const boutinArea = finite(details.boutinArea) && details.boutinArea > 0
     ? details.boutinArea : (isResidentialRental && finite(item.area) && item.area > 0 ? item.area : undefined);
-  const source = { ...details, area: item.area, boutinArea, rooms: item.rooms, bedrooms: item.bedrooms, propertyTypeLabel };
+  // La vue écrite par l'agence (« Sur jardins ») remplace la ligne oui/non « Vue dégagée ».
+  const source = { ...details, area: item.area, boutinArea, rooms: item.rooms, bedrooms: item.bedrooms, propertyTypeLabel,
+    ...(text(details.view) ? { clearView: undefined } : {}) };
   const applicable = definitions => garage ? definitions.filter(([key]) => GARAGE_KEYS.has(key)) : definitions;
   const surfaces = rows(source, applicable(SURFACES));
   const layout = rows(source, applicable(LAYOUT));
