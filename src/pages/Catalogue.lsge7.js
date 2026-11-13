@@ -3,9 +3,8 @@
 // du répéteur et de #button4 (« En voir plus ») ; aucun onClick ajouté à ce bouton.
 // Réduire au chargement : repeater1, button4, emptyState, filterError.
 // Garder imageX2/cover et cardSummary/summary connectés au CMS.
-// onItemReady précède les liaisons CMS : le dataset virtuel de chaque carte
-// fournit son onReady après leur alimentation, y compris après « En voir plus ».
-// https://dev.wix.com/docs/velo/velo-only-apis/$w/repeater/using-connected-datasets-and-repetaers
+// onItemReady reçoit l'élément complet du dataset pour chaque carte, y compris
+// celles ajoutées par « Voir plus de biens » : c'est lui qui règle la carte.
 import wixData from 'wix-data';
 
 const DATASET_ID = '#dynamicDataset';
@@ -51,17 +50,11 @@ $w.onReady(() => {
   }
 
   $w('#repeater1').onItemReady(($item, itemData) => {
-    // Écarter les images/textes de modèle avant que la carte apparaisse.
-    updateCard($item, { _id: itemData._id }).catch(() => {
-      console.error('Impossible de préparer une carte de bien.');
-    });
-    const cardDataset = $item(DATASET_ID);
-    cardDataset.onReady(() => {
-      const current = cardDataset.getCurrentItem() || {};
-      if (current._id !== itemData._id) return;
-      return updateCard($item, current).catch(() => {
-        console.error('Impossible de mettre en forme une carte de bien.');
-      });
+    // Avant : la carte était d'abord vidée, puis remplie quand son dataset
+    // virtuel se déclarait prêt. Pour les cartes ajoutées par « Voir plus de
+    // biens », ce second temps n'arrivait pas : ni photo ni résumé.
+    updateCard($item, itemData).catch(() => {
+      console.error('Impossible de mettre en forme une carte de bien.');
     });
   });
 
