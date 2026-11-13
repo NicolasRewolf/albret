@@ -447,4 +447,185 @@ const REPEATERS = [
   { id: '#repeater3', key: 'surfaces', label: '#text29', value: '#text30', heading: '#text31' },
   { id: '#repeater4', key: 'layout', label: '#text34', value: '#text33', heading: '#text32' },
   { id: '#repeater5', key: 'comfort', label: '#text37', value: '#text36', heading: '#text35' },
-  { id: '#repeater6', key: 'rentalRows', label: '#text81', value:
+  { id: '#repeater6', key: 'rentalRows', label: '#text81', value: '#text80' },
+];
+
+$w.onReady(() => {
+  for (const config of REPEATERS) {
+    $w(config.id).onItemReady(($item, row) => renderRepeaterRow($item, row, config));
+  }
+  // L'ancien lien de maquette locale est remplacé par un défilement dans cette page.
+  $w('#text17').html = '<p>Voir toutes les caractéristiques ↓</p>';
+  $w('#text17').onClick(() => $w('#section7').scrollTo());
+  const dataset = $w('#dynamicDataset');
+  let sequence = Promise.resolve();
+  const queue = item => {
+    sequence = sequence.then(() => renderListingView(buildListingView(item))).catch(error => {
+      console.error('[Albret/Biens] Rendu de la fiche impossible :', error?.message || String(error));
+    });
+    return sequence;
+  };
+  queue({});
+  dataset.onReady(() => queue(dataset.getCurrentItem() || {}));
+  dataset.onCurrentIndexChanged(() => queue(dataset.getCurrentItem() || {}));
+  dataset.onError(() => queue({}));
+});
+
+function renderRepeaterRow($item, row, config) {
+  if (config.label) $item(config.label).text = row.label;
+  $item(config.value).text = row.value;
+  if (config.icon) {
+    const icon = $item(config.icon);
+    const source = DESIGN_METRIC_ICONS[row._id.replace(/^(?:hero|metric)-/, '')];
+    if (source) {
+      icon.src = source;
+      icon.expand();
+    } else {
+      icon.collapse();
+    }
+  }
+}
+
+async function renderListingView(view) {
+  const changes = [];
+  const visible = (id, show) => changes.push(setDisplayed(id, Boolean(show)));
+  const text = (id, value) => {
+    $w(id).text = typeof value === 'string' ? value : '';
+    visible(id, Boolean(value));
+  };
+  text('#text10', view.title);
+  text('#text12', view.city);
+  text('#text13', view.priceLabel);
+  text('#text11', view.transactionTypeLabel);
+  text('#text14', view.feesShort);
+  text('#text16', view.description);
+  $w('#gallery2').items = view.gallery;
+  visible('#gallery2', view.gallery.length > 0);
+  visible('#line1', view.gallery.length > 0);
+
+  for (const config of REPEATERS) {
+    const rows = view[config.key];
+    $w(config.id).data = rows;
+    // Wix ne relance pas onItemReady pour les ID déjà présents au changement de bien.
+    $w(config.id).forEachItem(($item, row) => renderRepeaterRow($item, row, config));
+    visible(config.id, rows.length > 0);
+    if (config.heading) visible(config.heading, rows.length > 0);
+  }
+  const hasCharacteristics = ['quickFacts', 'surfaces', 'layout', 'comfort']
+    .some(key => view[key].length > 0);
+  visible('#box24', hasCharacteristics);
+  visible('#section7', hasCharacteristics);
+  visible('#text17', hasCharacteristics);
+  visible('#box19', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
+  visible('#section6', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
+
+  const energy = view.energy;
+  const hasDpe = Boolean(energy.dpe.visible);
+  const hasGes = Boolean(energy.ges.label || energy.ges.consumption);
+  text('#text38', energy.visible ? view.transactionTypeLabel : '');
+  text('#text39', energy.visible ? 'Diagnostic énergétique' : '');
+  text('#text42', energy.dpe.label);
+  text('#text43', [energy.dpe.consumption, energy.dpe.finalConsumption ? `Énergie finale : ${energy.dpe.finalConsumption}` : ''].filter(Boolean).join('\n'));
+  text('#text45', energy.ges.label);
+  text('#text44', energy.ges.consumption);
+  const energyExtras = energy.rows.length > 0;
+  $w('#text47').html = energyEstimateHtml(energy);
+  visible('#text47', Boolean(energy.annualRange || energyExtras));
+  text('#text46', energy.annualRange ? 'Dépense annuelle estimée' : energyExtras ? 'Informations complémentaires' : '');
+  text('#text49', energy.date);
+  text('#text51', energy.reference);
+  visible('#text40', hasDpe);
+  visible('#box31', hasDpe);
+  visible('#text41', hasGes);
+  visible('#box32', hasGes);
+  visible('#box33', Boolean(energy.annualRange || energyExtras));
+  visible('#text48', Boolean(energy.date));
+  visible('#text50', Boolean(energy.reference));
+  visible('#line6', Boolean(energy.annualRange || energyExtras));
+  visible('#line7', Boolean(energy.date || energy.reference));
+  visible('#html1', false); // L'intégration HTML du modèle ne contient pas de graphique fonctionnel.
+  visible('#box30', energy.visible);
+
+  // Les deux panneaux sont exclusifs. On efface aussi les valeurs du panneau
+  // inactif pour qu'un changement de bien ne conserve aucune donnée précédente.
+  const isSale = view.transaction === 'sale';
+  const isRental = view.transaction === 'rent';
+  const finance = isSale ? view.financialRows.slice(0, 3) : [];
+  const additionalFinance = isSale ? view.financialRows.slice(3) : [];
+  const pairs = [['#text58', '#text53'], ['#text57', '#text52'], ['#text66', '#text67']];
+  pairs.forEach(([labelId, valueId], index) => {
+    text(labelId, finance[index]?.label || '');
+    text(valueId, finance[index]?.value || '');
+  });
+  const notes = isSale ? [...view.financialNotes, view.legalText, view.reference ? `Référence : ${view.reference}` : '']
+    .filter(Boolean).join('\n\n') : '';
+  const feeUrl = isSale ? safeWebUrl(view.feeScheduleUrl) : '';
+  const hasFinancial = Boolean(finance.length || additionalFinance.length || notes || feeUrl);
+  text('#text65', hasFinancial ? view.transactionTypeLabel : '');
+  text('#text64', hasFinancial ? view.financialHeading : '');
+  // Les conditions supplémentaires occupent la largeur du bloc de notes,
+  // plutôt que de surcharger la troisième cellule du modèle.
+  $w('#text68').html = financialNotesHtml(additionalFinance, notes);
+  visible('#text68', Boolean(additionalFinance.length || notes));
+  $w('#text69').html = feeUrl
+    ? `<p><a href="${escapeHtml(feeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
+    : '<p></p>';
+  visible('#text69', Boolean(feeUrl));
+  visible('#box38', Boolean(additionalFinance.length || notes || feeUrl));
+  visible('#achat', isSale && hasFinancial);
+
+  const rentalNotes = isRental ? [...view.rentalNotes, view.rentalLegalText,
+    view.reference ? `Référence : ${view.reference}` : ''].filter(Boolean).join('\n\n') : '';
+  const rentalFeeUrl = isRental ? safeWebUrl(view.feeScheduleUrl) : '';
+  const hasRental = isRental && Boolean(view.rentalRows.length || rentalNotes || rentalFeeUrl);
+  text('#text79', hasRental ? view.transactionTypeLabel : '');
+  text('#text78', hasRental ? 'Loyer et conditions' : '');
+  $w('#text83').html = financialNotesHtml([], rentalNotes);
+  visible('#text83', Boolean(rentalNotes));
+  $w('#text82').html = rentalFeeUrl
+    ? `<p><a href="${escapeHtml(rentalFeeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
+    : '<p></p>';
+  visible('#text82', Boolean(rentalFeeUrl));
+  visible('#box42', Boolean(rentalNotes || rentalFeeUrl));
+  visible('#location', hasRental);
+  visible('#section8', energy.visible || hasFinancial || hasRental);
+  await Promise.all(changes);
+}
+
+function energyEstimateHtml(energy) {
+  const hasSubscription = /,\s*abonnement inclus$/.test(energy.annualRange);
+  const amount = energy.annualRange.replace(/,\s*abonnement inclus$/, '');
+  const parts = [];
+  if (amount) parts.push(`<p style="font-size:20px;line-height:1.35">${escapeHtml(amount)}</p>`);
+  if (hasSubscription) parts.push('<p style="font-size:12px;line-height:1.4">Abonnement inclus.</p>');
+  for (const row of energy.rows) parts.push(
+    `<p style="font-size:12px;line-height:1.4">${escapeHtml(row.label)} : ${escapeHtml(row.value)}</p>`);
+  return parts.join('') || '<p></p>';
+}
+
+function financialNotesHtml(rows, notes) {
+  const parts = [];
+  if (rows.length) parts.push('<p style="font-size:12px;line-height:1.4;font-weight:600">Autres conditions</p>');
+  for (const row of rows) parts.push(
+    `<p style="font-size:12px;line-height:1.4"><span style="font-weight:600">${escapeHtml(row.label)} :</span> ${escapeHtml(row.value)}</p>`);
+  if (notes) parts.push(`<p style="font-size:12px;line-height:1.4">${escapeHtml(notes).replace(/\r?\n/g, '<br>')}</p>`);
+  return parts.join('') || '<p></p>';
+}
+
+function setDisplayed(id, displayed) {
+  return displayed ? $w(id).expand() : $w(id).collapse();
+}
+
+function safeWebUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : '';
+  } catch { return ''; }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[character]);
+}
