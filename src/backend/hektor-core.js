@@ -2838,7 +2838,13 @@ function sourceReference(value) {
 async function call2(operation, code, ...args) {
   try {
     return await operation(...args);
-  } catch {
+  } catch (error) {
+    console.error("HEKTOR_MEDIA_CALL_ERROR", JSON.stringify({
+      code,
+      arg0: args[0],
+      message: error?.message || String(error),
+      details: error?.details || null
+    }));
     fail7(code);
   }
 }
@@ -3154,10 +3160,12 @@ async function readMediaFileInfo(fileUrl, { getFileInfo, getFileDescriptor: getF
   const match = typeof fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s#]+(?:#[^\s]*)?$/.exec(fileUrl);
   if (!match) fail8("MEDIA_INVALID_FILE_URI");
   const info = await getFileInfo(fileUrl);
+  console.info("HEKTOR_MEDIA_INFO_DEBUG", JSON.stringify({ fileId: match[1], info }));
   const answered = object5(info) && typeof info.fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\//.exec(info.fileUrl);
   if (!answered || answered[1] !== match[1]) fail8("MEDIA_INCOMPLETE_FILE_INFO");
   if (info.opStatus !== void 0 && info.opStatus !== null) return { ...info, readinessSource: "legacy-op-status" };
   const descriptor = await getFileDescriptor2(match[1]);
+  console.info("HEKTOR_MEDIA_DESCRIPTOR_DEBUG", JSON.stringify({ fileId: match[1], descriptor }));
   if (!object5(descriptor) || descriptor._id !== match[1] || typeof descriptor.operationStatus !== "string" || !descriptor.operationStatus) fail8("MEDIA_INCOMPLETE_FILE_DESCRIPTOR");
   if (descriptor.operationStatus !== "READY") return {
     ...info,
