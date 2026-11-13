@@ -727,6 +727,10 @@ function publicDetails(value) {
     result.levels = number(value.levels, 100);
     if (!Number.isSafeInteger(result.levels)) fail("INVALID_PUBLIC_DETAILS");
   }
+  if (value.propertyTax !== void 0) result.propertyTax = number(value.propertyTax, 1e10);
+  for (const key of ["view", "sharedWalls"]) {
+    if (value[key] !== void 0) result[key] = text(value[key], 80);
+  }
   if (value.garden !== void 0) {
     if (typeof value.garden !== "boolean") fail("INVALID_PUBLIC_DETAILS");
     result.garden = value.garden;
@@ -1273,9 +1277,10 @@ var TYPE_CODES = new Map([
   ...[22, 231, 232, 235, 2313, 2314, 2316, 2317].map((code) => [code, "local"])
 ]);
 var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
+var GEORISQUES_MENTION = "Les informations sur les risques auxquels ce bien est exposé sont disponibles sur le site Géorisques : www.georisques.gouv.fr.";
 var AVAILABLE_STATUS = 2;
 var SOLD_STATUS = 5;
-var READER_VERSION = "2026-11-13.2";
+var READER_VERSION = "2026-11-13.3";
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
 var FEE_LABELS = { buyer: "acquéreur", seller: "vendeur", both: "acquéreur et vendeur" };
@@ -1562,6 +1567,14 @@ function mapAd(ad, who, sold = false) {
   put("featured", flag(ad, "coup_de_coeur"));
   put("buildableLand", safeFlag(ad, "Constructible") ?? safeFlag(ad, "constructible"));
   if (propertyTypeCode === 17 || /\bduplex\b/u.test(plainLabel(propertyTypeLabel))) put("duplex", true);
+  for (const [key, tag] of [["view", "vue"], ["sharedWalls", "mitoyens"]]) {
+    const said = textOf(ad, tag);
+    if (said && said.length <= 80 && !/^(?:0|1|oui|non)$/iu.test(said)) {
+      const shown = publicText(said, 80, { singleLine: true, name: tag });
+      put(key, shown.charAt(0).toUpperCase() + shown.slice(1));
+    }
+  }
+  if (transaction === "sale") put("propertyTax", cents(number2(ad, "foncier", { zeroIsAbsent: true })));
   const viewRaw = plainLabel(textOf(ad, "vue"));
   if (viewRaw) {
     if (["1", "oui"].includes(viewRaw) || /\b(?:degagee|panoramique|mer|ocean|parc|jardin|montagne)\b/u.test(viewRaw)) put("clearView", true);
@@ -1602,6 +1615,8 @@ function mapAd(ad, who, sold = false) {
     const controlled = residential && details.rentControlled === true;
     put("baseRent", cents(number2(ad, "loyer_base", { required: controlled, zeroIsAbsent: true })));
     put("referenceRent", cents(number2(ad, "loyer_reference_majore", { required: controlled, zeroIsAbsent: true })));
+    const excludingCharges = details.rentChargesIncluded === false ? price : details.rentChargesIncluded === true && details.rentCharges !== void 0 ? price - details.rentCharges : void 0;
+    if (controlled && excludingCharges > details.referenceRent) put("rentSupplement", cents(excludingCharges - details.referenceRent));
   }
   const schedule = sold ? "" : textOf(ad, "urlBaremeHono");
   if (schedule) {
@@ -1651,6 +1666,7 @@ function mapAd(ad, who, sold = false) {
       erpComment ? `(${erpComment})` : ""
     ].filter(Boolean).join(" ")}.`);
   }
+  if (erpFlag === true) extraDisclosures.push(GEORISQUES_MENTION);
   const virtualTourUrl = optionalWebUrl(textOf(ad, "visite_virtuelle") || textOf(ad, "uRLVisiteVirtuelle"), 256);
   const priceLabel = sold ? "Vendu" : transaction === "sale" ? money(price) : `Loyer : ${money(price)}${details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : ""}`;
   const images = childOf(ad, "images");
