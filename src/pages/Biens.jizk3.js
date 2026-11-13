@@ -16,6 +16,14 @@ const year = value => Number.isSafeInteger(value) && value > 0 && value <= 9999 
 const enumValue = labels => value => typeof value === 'string' && Object.hasOwn(labels, value) ? labels[value] : '';
 
 function date(value) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    value = value.toISOString().slice(0, 10);
+  } else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) value = trimmed.slice(0, 10);
+    else if (/^\d{4}$/.test(trimmed)) return trimmed;
+    else value = trimmed;
+  }
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return '';
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== value) return '';
@@ -452,11 +460,21 @@ const REPEATERS = [
 
 $w.onReady(() => {
   for (const config of REPEATERS) {
-    $w(config.id).onItemReady(($item, row) => renderRepeaterRow($item, row, config));
+    const rep = $w(config.id);
+    if (rep && typeof rep.onItemReady === 'function') {
+      rep.onItemReady(($item, row) => renderRepeaterRow($item, row, config));
+    }
   }
-  // L'ancien lien de maquette locale est remplacé par un défilement dans cette page.
-  $w('#text17').html = '<p>Voir toutes les caractéristiques ↓</p>';
-  $w('#text17').onClick(() => $w('#section7').scrollTo());
+  const moreLink = $w('#text17');
+  if (moreLink && 'html' in moreLink) {
+    moreLink.html = '<p>Voir toutes les caractéristiques ↓</p>';
+    if (typeof moreLink.onClick === 'function') {
+      moreLink.onClick(() => {
+        const target = $w('#section7');
+        if (target && typeof target.scrollTo === 'function') target.scrollTo();
+      });
+    }
+  }
   const dataset = $w('#dynamicDataset');
   let sequence = Promise.resolve();
   const queue = item => {
@@ -473,15 +491,19 @@ $w.onReady(() => {
 
 function renderRepeaterRow($item, row, config) {
   if (!row || typeof row.value !== 'string') return;
-  if (config.label) $item(config.label).text = typeof row.label === 'string' ? row.label : '';
-  $item(config.value).text = row.value;
+  if (config.label) {
+    const labelEl = $item(config.label);
+    if (labelEl) labelEl.text = typeof row.label === 'string' ? row.label : '';
+  }
+  const valEl = $item(config.value);
+  if (valEl) valEl.text = row.value;
   if (config.icon) {
     const icon = $item(config.icon);
     const source = DESIGN_METRIC_ICONS[String(row._id || '').replace(/^(?:hero|metric)-/, '')];
-    if (source) {
+    if (icon && source) {
       icon.src = source;
-      icon.expand();
-    } else {
+      if (typeof icon.expand === 'function') icon.expand();
+    } else if (icon && typeof icon.collapse === 'function') {
       icon.collapse();
     }
   }
@@ -490,30 +512,39 @@ function renderRepeaterRow($item, row, config) {
 async function renderListingView(view) {
   const changes = [];
   const visible = (id, show) => changes.push(setDisplayed(id, Boolean(show)));
-  const text = (id, value) => {
-    $w(id).text = typeof value === 'string' ? value : '';
+  const setText = (id, value) => {
+    const el = $w(id);
+    if (el) el.text = typeof value === 'string' ? value : '';
     visible(id, Boolean(value));
   };
-  text('#text10', view.title);
-  text('#text12', view.city);
-  text('#text13', view.priceLabel);
-  text('#text11', view.transactionTypeLabel);
-  text('#text14', view.feesShort);
-  text('#text16', view.description);
-  $w('#gallery2').items = view.gallery;
+  const setHtml = (id, markup) => {
+    const el = $w(id);
+    if (el) el.html = markup;
+  };
+  setText('#text10', view.title);
+  setText('#text12', view.city);
+  setText('#text13', view.priceLabel);
+  setText('#text11', view.transactionTypeLabel);
+  setText('#text14', view.feesShort);
+  setText('#text16', view.description);
+  const gallery = $w('#gallery2');
+  if (gallery) gallery.items = view.gallery;
   visible('#gallery2', view.gallery.length > 0);
   visible('#line1', view.gallery.length > 0);
 
   for (const config of REPEATERS) {
     const rows = view[config.key];
     const byId = new Map(rows.map(row => [row._id, row]));
-    $w(config.id).data = rows;
-    // Wix ne relance pas onItemReady pour les ID déjà présents au changement de bien,
-    // et peut encore exposer les éléments modèles avant la fin de mise à jour de .data.
-    $w(config.id).forEachItem(($item, row) => {
-      const fresh = byId.get(row?._id);
-      if (fresh) renderRepeaterRow($item, fresh, config);
-    });
+    const rep = $w(config.id);
+    if (rep) {
+      rep.data = rows;
+      if (typeof rep.forEachItem === 'function') {
+        rep.forEachItem(($item, row) => {
+          const fresh = byId.get(row?._id);
+          if (fresh) renderRepeaterRow($item, fresh, config);
+        });
+      }
+    }
     visible(config.id, rows.length > 0);
     if (config.heading) visible(config.heading, rows.length > 0);
   }
@@ -528,18 +559,18 @@ async function renderListingView(view) {
   const energy = view.energy;
   const hasDpe = Boolean(energy.dpe.visible);
   const hasGes = Boolean(energy.ges.label || energy.ges.consumption);
-  text('#text38', energy.visible ? view.transactionTypeLabel : '');
-  text('#text39', energy.visible ? 'Diagnostic énergétique' : '');
-  text('#text42', energy.dpe.label);
-  text('#text43', [energy.dpe.consumption, energy.dpe.finalConsumption ? `Énergie finale : ${energy.dpe.finalConsumption}` : ''].filter(Boolean).join('\n'));
-  text('#text45', energy.ges.label);
-  text('#text44', energy.ges.consumption);
+  setText('#text38', energy.visible ? view.transactionTypeLabel : '');
+  setText('#text39', energy.visible ? 'Diagnostic énergétique' : '');
+  setText('#text42', energy.dpe.label);
+  setText('#text43', [energy.dpe.consumption, energy.dpe.finalConsumption ? `Énergie finale : ${energy.dpe.finalConsumption}` : ''].filter(Boolean).join('\n'));
+  setText('#text45', energy.ges.label);
+  setText('#text44', energy.ges.consumption);
   const energyExtras = energy.rows.length > 0;
-  $w('#text47').html = energyEstimateHtml(energy);
+  setHtml('#text47', energyEstimateHtml(energy));
   visible('#text47', Boolean(energy.annualRange || energyExtras));
-  text('#text46', energy.annualRange ? 'Dépense annuelle estimée' : energyExtras ? 'Informations complémentaires' : '');
-  text('#text49', energy.date);
-  text('#text51', energy.reference);
+  setText('#text46', energy.annualRange ? 'Dépense annuelle estimée' : energyExtras ? 'Informations complémentaires' : '');
+  setText('#text49', energy.date);
+  setText('#text51', energy.reference);
   visible('#text40', hasDpe);
   visible('#box31', hasDpe);
   visible('#text41', hasGes);
@@ -549,33 +580,29 @@ async function renderListingView(view) {
   visible('#text50', Boolean(energy.reference));
   visible('#line6', Boolean(energy.annualRange || energyExtras));
   visible('#line7', Boolean(energy.date || energy.reference));
-  visible('#html1', false); // L'intégration HTML du modèle ne contient pas de graphique fonctionnel.
+  visible('#html1', false);
   visible('#box30', energy.visible);
 
-  // Les deux panneaux sont exclusifs. On efface aussi les valeurs du panneau
-  // inactif pour qu'un changement de bien ne conserve aucune donnée précédente.
   const isSale = view.transaction === 'sale';
   const isRental = view.transaction === 'rent';
   const finance = isSale ? view.financialRows.slice(0, 3) : [];
   const additionalFinance = isSale ? view.financialRows.slice(3) : [];
   const pairs = [['#text58', '#text53'], ['#text57', '#text52'], ['#text66', '#text67']];
   pairs.forEach(([labelId, valueId], index) => {
-    text(labelId, finance[index]?.label || '');
-    text(valueId, finance[index]?.value || '');
+    setText(labelId, finance[index]?.label || '');
+    setText(valueId, finance[index]?.value || '');
   });
   const notes = isSale ? [...view.financialNotes, view.legalText, view.reference ? `Référence : ${view.reference}` : '']
     .filter(Boolean).join('\n\n') : '';
   const feeUrl = isSale ? safeWebUrl(view.feeScheduleUrl) : '';
   const hasFinancial = Boolean(finance.length || additionalFinance.length || notes || feeUrl);
-  text('#text65', hasFinancial ? view.transactionTypeLabel : '');
-  text('#text64', hasFinancial ? view.financialHeading : '');
-  // Les conditions supplémentaires occupent la largeur du bloc de notes,
-  // plutôt que de surcharger la troisième cellule du modèle.
-  $w('#text68').html = financialNotesHtml(additionalFinance, notes);
+  setText('#text65', hasFinancial ? view.transactionTypeLabel : '');
+  setText('#text64', hasFinancial ? view.financialHeading : '');
+  setHtml('#text68', financialNotesHtml(additionalFinance, notes));
   visible('#text68', Boolean(additionalFinance.length || notes));
-  $w('#text69').html = feeUrl
+  setHtml('#text69', feeUrl
     ? `<p><a href="${escapeHtml(feeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
-    : '<p></p>';
+    : '<p></p>');
   visible('#text69', Boolean(feeUrl));
   visible('#box38', Boolean(additionalFinance.length || notes || feeUrl));
   visible('#achat', isSale && hasFinancial);
@@ -584,13 +611,13 @@ async function renderListingView(view) {
     view.reference ? `Référence : ${view.reference}` : ''].filter(Boolean).join('\n\n') : '';
   const rentalFeeUrl = isRental ? safeWebUrl(view.feeScheduleUrl) : '';
   const hasRental = isRental && Boolean(view.rentalRows.length || rentalNotes || rentalFeeUrl);
-  text('#text79', hasRental ? view.transactionTypeLabel : '');
-  text('#text78', hasRental ? 'Loyer et conditions' : '');
-  $w('#text83').html = financialNotesHtml([], rentalNotes);
+  setText('#text79', hasRental ? view.transactionTypeLabel : '');
+  setText('#text78', hasRental ? 'Loyer et conditions' : '');
+  setHtml('#text83', financialNotesHtml([], rentalNotes));
   visible('#text83', Boolean(rentalNotes));
-  $w('#text82').html = rentalFeeUrl
+  setHtml('#text82', rentalFeeUrl
     ? `<p><a href="${escapeHtml(rentalFeeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
-    : '<p></p>';
+    : '<p></p>');
   visible('#text82', Boolean(rentalFeeUrl));
   visible('#box42', Boolean(rentalNotes || rentalFeeUrl));
   visible('#location', hasRental);
@@ -619,7 +646,14 @@ function financialNotesHtml(rows, notes) {
 }
 
 function setDisplayed(id, displayed) {
-  return displayed ? $w(id).expand() : $w(id).collapse();
+  const el = $w(id);
+  if (!el) return Promise.resolve();
+  if (displayed && typeof el.expand === 'function') return el.expand();
+  if (!displayed && typeof el.collapse === 'function') return el.collapse();
+  if (displayed && typeof el.show === 'function') return el.show();
+  if (!displayed && typeof el.hide === 'function') return el.hide();
+  console.warn(`[Albret/Biens] Élément introuvable ou sans expand/collapse : ${id}`);
+  return Promise.resolve();
 }
 
 function safeWebUrl(value) {
