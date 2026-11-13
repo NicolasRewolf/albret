@@ -71,9 +71,8 @@ var HEKTOR = Object.freeze({
     // Sized for the 60 write requests a minute of the free plan, worst case:
     // 2 grouped writes per chunk + one receipt per photo if every media event
     // arrives before its chunk is recorded + lock, log and state ≈ 50.
-    // 8 since 13 November 2026: on the unpublished site a manual run is one web
-    // request, cut at 14 s on the free plan. The first real run started 20
-    // imports, was cut, and left them without an answer (MEDIA_RECOVERY_REQUIRED).
+    // The site is published (noindex) since 13 November 2026: the hourly job
+    // imports the photos, without the 14 s limit of a manual web request.
     maxOperationsPerRun: 40,
     maxRunMs: 25e3,
     remote: Object.freeze({
@@ -250,10 +249,52 @@ var KITCHEN_LABELS = Object.freeze({
   8: "Coin cuisine équipé",
   9: "Équipée"
 });
-var PROPERTY_CODE_FIELDS = [
-  [33, "heatingCode", "heatingLabel", HEATING_LABELS],
-  [34, "kitchenCode", "kitchenLabel", KITCHEN_LABELS]
-];
+var KITCHEN_WORDS = Object.freeze({
+  americaine: "américaine",
+  kitchenette: "kitchenette",
+  separee: "séparée",
+  sans: "sans cuisine",
+  amenage: "aménagée",
+  amenagee: "aménagée",
+  equipee: "équipée",
+  "semi-equipee": "semi-équipée"
+});
+var HEATING_WORDS = Object.freeze({
+  FORMAT_CHAUFF_COLLECTIF: "collectif",
+  FORMAT_CHAUFF_INDIVIDUEL: "individuel",
+  FORMAT_CHAUFF_CENTRAL: "central",
+  FORMAT_CHAUFF_URBAIN: "urbain",
+  ENERGIE_CHAUFF_GAZ: "gaz",
+  ENERGIE_CHAUFF_ELECTRIQUE: "électrique",
+  ENERGIE_CHAUFF_FIOUL: "fioul",
+  ENERGIE_CHAUFF_CHARBON: "charbon",
+  ENERGIE_CHAUFF_BOIS: "bois",
+  ENERGIE_CHAUFF_GRANULES: "granulés",
+  ENERGIE_CHAUFF_SOLAIRE: "solaire",
+  ENERGIE_CHAUFF_GEOTHERMIE: "géothermie",
+  ENERGIE_CHAUFF_POMPE: "pompe à chaleur",
+  ENERGIE_CHAUFF_CLIMATISATION: "climatisation",
+  ENERGIE_CHAUFF_MIXTE: "mixte",
+  ENERGIE_CHAUFF_AEROTHERMIE: "aérothermie",
+  TYPE_CHAUFF_RADIATEUR: "radiateur",
+  TYPE_CHAUFF_SOL: "au sol",
+  TYPE_CHAUFF_AIR: "air pulsé",
+  TYPE_CHAUFF_CONVECTEUR: "convecteur",
+  TYPE_CHAUFF_RAYONNANT: "panneaux rayonnants",
+  TYPE_CHAUFF_POELE: "poêle",
+  TYPE_CHAUFF_CHEMINEE: "cheminée",
+  TYPE_CHAUFF_CHAUDIERE: "chaudière"
+});
+var wordLabel = (items) => {
+  const label = [...new Set(items.map((words) => words.filter(Boolean).join(", ")).filter(Boolean))].join(" ; ");
+  return label ? label.charAt(0).toUpperCase() + label.slice(1) : void 0;
+};
+var madeOf = (vocabulary) => {
+  const allowed = new Set(Object.values(vocabulary));
+  return (label) => typeof label === "string" && label.length > 0 && label.length <= 120 && label.toLowerCase().split(/, | ; /u).every((word) => allowed.has(word));
+};
+var isKitchenLabel = madeOf(KITCHEN_WORDS);
+var isHeatingLabel = madeOf(HEATING_WORDS);
 
 // velo/backend/lib/poliris-public-fields.js
 var definitions = [
@@ -661,8 +702,11 @@ var DETAIL_BOOLEANS = [
 var DETAIL_ENUMS = {
   feesPayer: ["buyer", "seller", "both"],
   chargeTerms: ["monthly_flat", "monthly_provision_annual_adjustment", "annual_reimbursement"],
-  dpeVersion: ["DPE_v01-2011", "DPE_v07-2021"]
+  dpeVersion: ["DPE_v01-2011", "DPE_v07-2021"],
+  // A sold sale stays on the site as a reference, without its price or fees.
+  commercialStatus: ["sold"]
 };
+var SOLD_FORBIDDEN = ["feesPayer", "feesBuyerPercent", "priceExcludingBuyerFees", "feeScheduleUrl"];
 function publicDetails(value) {
   if (value === void 0) return {};
   if (!object(value)) fail("INVALID_PUBLIC_DETAILS");
@@ -676,12 +720,21 @@ function publicDetails(value) {
       if (!Number.isSafeInteger(result[key])) fail("INVALID_PUBLIC_DETAILS");
     }
   }
-  for (const [, key, labelKey, labels] of PROPERTY_CODE_FIELDS) {
+  for (const key of ["boutinArea", "carrezArea", "gardenArea"]) {
+    if (value[key] !== void 0) result[key] = number(value[key], 1e7);
+  }
+  if (value.levels !== void 0) {
+    result.levels = number(value.levels, 100);
+    if (!Number.isSafeInteger(result.levels)) fail("INVALID_PUBLIC_DETAILS");
+  }
+  if (value.garden !== void 0) {
+    if (typeof value.garden !== "boolean") fail("INVALID_PUBLIC_DETAILS");
+    result.garden = value.garden;
+  }
+  for (const [key, valid] of [["kitchenLabel", isKitchenLabel], ["heatingLabel", isHeatingLabel]]) {
     if (value[key] !== void 0) {
-      const code = number(value[key], 1e10);
-      if (!Number.isSafeInteger(code) || !Object.hasOwn(labels, code)) fail("INVALID_PUBLIC_DETAILS");
-      result[key] = code;
-      result[labelKey] = labels[code];
+      if (!valid(value[key])) fail("INVALID_PUBLIC_DETAILS");
+      result[key] = value[key];
     }
   }
   for (const key of DETAIL_NUMBERS) {
@@ -731,6 +784,9 @@ function listing(value) {
   if (!["sale", "rent"].includes(value.transaction)) fail("INVALID_TRANSACTION");
   if (!["appartement", "maison", "bureau", "local", "terrain", "autre"].includes(value.propertyType)) fail("INVALID_PROPERTY_TYPE");
   if (!Array.isArray(value.photos) || value.photos.length > 40) fail("INVALID_PHOTOS");
+  const details = publicDetails(value.publicDetails);
+  const sold = details.commercialStatus === "sold";
+  if (sold && (value.transaction !== "sale" || value.price !== void 0 || SOLD_FORBIDDEN.some((key) => details[key] !== void 0))) fail("INVALID_SOLD_LISTING");
   const item = {
     sourceId,
     publication: "published",
@@ -738,11 +794,11 @@ function listing(value) {
     description: text(value.description, 15e3),
     transaction: value.transaction,
     propertyType: text(value.propertyType, 80),
-    publicDetails: publicDetails(value.publicDetails),
+    publicDetails: details,
     ...value.publicFields !== void 0 ? { publicFields: validatePublicFields(value.publicFields) } : {},
     city: text(value.city, 120),
     postalCode: text(value.postalCode, 20),
-    price: number(value.price, 1e10),
+    ...sold ? {} : { price: number(value.price, 1e10) },
     // Preserve Hektor's meaning: CC/HC/month, fees, price on request, etc.
     priceLabel: text(value.priceLabel, 180),
     // Optional for non-housing (parking, land); the reader requires it for housing.
@@ -754,7 +810,8 @@ function listing(value) {
       return result;
     }),
     // Plain text copied from approved public disclosures, never assembled from guesses.
-    legalText: text(value.legalText, 15e3)
+    // The mentions of an offer no longer apply to a sold listing.
+    legalText: sold ? text(value.legalText, 15e3, false) || "" : text(value.legalText, 15e3)
   };
   for (const key of ["rooms", "bedrooms"]) {
     if (value[key] !== void 0) item[key] = number(value[key], 1e3);
@@ -1217,6 +1274,7 @@ var TYPE_CODES = new Map([
 ]);
 var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
 var AVAILABLE_STATUS = 2;
+var SOLD_STATUS = 5;
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
 var FEE_LABELS = { buyer: "acquéreur", seller: "vendeur", both: "acquéreur et vendeur" };
@@ -1367,41 +1425,12 @@ function safeFlag(ad, name) {
   if (raw === "0" || raw === "NON") return false;
   return void 0;
 }
-function mapKitchenCode(raw) {
-  if (!raw) return void 0;
-  if (/^\d+$/u.test(raw) && Object.hasOwn(KITCHEN_LABELS, Number(raw))) return Number(raw);
-  const s = plainLabel(raw);
-  if (/\b(?:sans|aucune)\b/u.test(s)) return 1;
-  if (/\bindustrielle\b/u.test(s)) return 4;
-  const equipped = /\b(?:equipee|amenagee)\b/u.test(s) && !/\bsemi[- ]equipee\b/u.test(s);
-  if (/\b(?:americaine|ouverte)\b/u.test(s)) return equipped ? 6 : 2;
-  if (/\b(?:separee|fermee|independante)\b/u.test(s)) return equipped ? 7 : 3;
-  if (/\b(?:kitchenette|coin cuisine)\b/u.test(s)) return equipped ? 8 : 5;
-  if (/\b(?:equipee|semi[- ]equipee|amenagee)\b/u.test(s)) return 9;
-  return void 0;
+function kitchenLabel(raw) {
+  return wordLabel([raw.split(/\s+-\s*|^-\s*/u).map((part) => KITCHEN_WORDS[plainLabel(part.trim())])]);
 }
-function mapHeatingCode(ad) {
-  const direct = textOf(ad, "chauffage");
-  if (/^\d+$/u.test(direct) && Object.hasOwn(HEATING_LABELS, Number(direct))) return Number(direct);
-  const parts = [direct];
+function heatingLabel(ad) {
   const group = childOf(ad, "chauffages");
-  if (group) {
-    for (const node of childrenOf(group, "chauffage")) {
-      parts.push(textOf(node, "type_chauffage"), textOf(node, "energie_chauffage"), textOf(node, "format_chauffage"), node.text);
-    }
-  }
-  const s = plainLabel(parts.filter(Boolean).join(" ").replace(/_/g, " "));
-  if (!s) return void 0;
-  if (/\b(?:climatisation|clim|reversible|pompe a chaleur|aerothermie|geothermie)\b/u.test(s)) {
-    if (/\b(?:central|centrale|collectif)\b/u.test(s)) return 20480;
-    if (/\bindividuel/u.test(s)) return 24576;
-    return 16384;
-  }
-  const formatBits = /\bcollectif\b/u.test(s) ? 4096 : /\bindividuel/u.test(s) ? 8192 : 0;
-  const energyBits = /\bgaz\b/u.test(s) ? 512 : /\b(?:fuel|fioul)\b/u.test(s) ? 1024 : /\belectri/u.test(s) ? 2048 : 0;
-  const typeBits = /\bmixte\b/u.test(s) ? 384 : /\b(?:sol|plancher)\b/u.test(s) ? 256 : /\b(?:radiateur|convecteur|panneau)\b/u.test(s) ? 128 : 0;
-  const code = formatBits + energyBits + typeBits;
-  return code > 0 && Object.hasOwn(HEATING_LABELS, code) ? code : void 0;
+  return wordLabel((group ? childrenOf(group, "chauffage") : []).map((node) => ["format_chauffage", "energie_chauffage", "type_chauffage"].map((tag) => HEATING_WORDS[textOf(node, tag)])));
 }
 function optionalWebUrl(raw, max = 256) {
   if (!raw || raw.length > max) return void 0;
@@ -1463,9 +1492,7 @@ function disclosure(details, energyLabel, gesLabel, extraLines = []) {
   add("energyCostAnnual", "Estimation annuelle des dépenses énergétiques, abonnement inclus", money);
   add("energyFinalConsumption", "Consommation d’énergie finale", (value) => `${value} kWh/m²/an`);
   add("financialConditions", "Conditions financières");
-  for (const line of extraLines) {
-    if (line) lines.push(line);
-  }
+  for (const line of extraLines) if (line) lines.push(line);
   return lines.join("\n");
 }
 function identity(ad, options) {
@@ -1484,7 +1511,7 @@ function identity(ad, options) {
     reference: textOf(ad, "reference").replace(/[\u0000-\u001f\u007f-\u009f]/gu, "").slice(0, 20)
   };
 }
-function mapAd(ad, who) {
+function mapAd(ad, who, sold = false) {
   const transaction = TRANSACTIONS[textOf(ad, "type_offre_code")];
   if (!transaction) fail2("HEKTOR_XML_UNSUPPORTED_TRANSACTION");
   const propertyTypeLabel = publicText(textOf(ad, "type_bien"), 80, { required: true, singleLine: true, name: "type_bien" });
@@ -1495,8 +1522,8 @@ function mapAd(ad, who) {
   if (!/^\d{5}$/u.test(postalCode)) fail2("HEKTOR_XML_INVALID_POSTAL_CODE");
   const priceNode = childOf(ad, "prix");
   if (priceNode?.attributes.currency && priceNode.attributes.currency !== "EUR") fail2("HEKTOR_XML_UNSUPPORTED_CURRENCY");
-  if (flag(ad, "nous_consulter") === true) fail2("HEKTOR_XML_UNSUPPORTED_HIDDEN_PRICE");
-  const price = number2(ad, "prix", { required: true, zeroIsAbsent: true });
+  if (!sold && flag(ad, "nous_consulter") === true) fail2("HEKTOR_XML_UNSUPPORTED_HIDDEN_PRICE");
+  const price = sold ? void 0 : number2(ad, "prix", { required: true, zeroIsAbsent: true });
   const energyLabel = flag(ad, "dpe_non_concerne") === true ? "NS" : flag(ad, "dpe_vierge") === true ? "VI" : energyClass(ad, "class_energie");
   const gesLabel = ["NS", "VI"].includes(energyLabel) ? energyLabel : energyClass(ad, "class_emission_gaz");
   const details = {};
@@ -1515,12 +1542,17 @@ function mapAd(ad, who) {
   put("bathrooms", number2(ad, "sdb", { integer: true, max: 1e3, zeroIsAbsent: true }));
   put("showerRooms", number2(ad, "sde", { integer: true, max: 1e3, zeroIsAbsent: true }));
   put("toilets", number2(ad, "wc", { integer: true, max: 1e3, zeroIsAbsent: true }));
-  put("balconies", number2(ad, "nb_balcons", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? (safeFlag(ad, "balcon") === true ? 1 : void 0));
-  put("terraces", number2(ad, "nb_terraces", { integer: true, max: 1e3, zeroIsAbsent: true }));
-  put("parkingSpaces", number2(ad, "nb_parkings", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? (safeFlag(ad, "parking") === true ? 1 : void 0));
-  put("garageSpaces", number2(ad, "nb_garages", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? (safeFlag(ad, "garage") === true ? 1 : void 0));
-  put("heatingCode", mapHeatingCode(ad));
-  put("kitchenCode", mapKitchenCode(textOf(ad, "cuisine")));
+  put("balconies", number2(ad, "nb_balcon", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? (safeFlag(ad, "balcon") === true ? 1 : void 0));
+  put("parkingSpaces", number2(ad, "nb_parking_ext", { integer: true, max: 1e3, zeroIsAbsent: true }));
+  put("garageSpaces", number2(ad, "nb_garage", { integer: true, max: 1e3, zeroIsAbsent: true }));
+  put("levels", number2(ad, "nb_niveaux", { integer: true, max: 100, zeroIsAbsent: true }));
+  put(transaction === "rent" ? "boutinArea" : "carrezArea", number2(ad, "surface_carrez", { max: 1e7, zeroIsAbsent: true }));
+  put("gardenArea", number2(ad, "surface_jardin", { max: 1e7, zeroIsAbsent: true }));
+  put("garden", safeFlag(ad, "jardin"));
+  put("elevator", safeFlag(ad, "ascenseur"));
+  put("accessible", safeFlag(ad, "acces_handicape"));
+  put("heatingLabel", heatingLabel(ad));
+  put("kitchenLabel", kitchenLabel(textOf(ad, "cuisine")));
   put("furnished", flag(ad, "meuble"));
   put("cellar", flag(ad, "cave"));
   put("terrace", flag(ad, "terrasse"));
@@ -1534,20 +1566,21 @@ function mapAd(ad, who) {
     if (["1", "oui"].includes(viewRaw) || /\b(?:degagee|panoramique|mer|ocean|parc|jardin|montagne)\b/u.test(viewRaw)) put("clearView", true);
     else if (["0", "non", "aucune", "vis a vis"].includes(viewRaw)) put("clearView", false);
   }
-  const envRaw = plainLabel(textOf(ad, "environnement"));
-  if (envRaw && /\bcalme\b/u.test(envRaw)) put("quiet", true);
+  if (/\bcalme\b/u.test(plainLabel(textOf(ad, "environnement")))) put("quiet", true);
   const expoRaw = plainLabel(textOf(ad, "exposition"));
-  if (expoRaw) {
-    if (/\bsud\b/u.test(expoRaw)) put("southFacing", true);
-    if (/\best\b/u.test(expoRaw)) put("eastFacing", true);
-    if (/\bouest\b/u.test(expoRaw)) put("westFacing", true);
-    if (/\bnord\b/u.test(expoRaw)) put("northFacing", true);
-  }
+  if (/\bsud\b/u.test(expoRaw)) put("southFacing", true);
+  if (/\best\b/u.test(expoRaw)) put("eastFacing", true);
+  if (/\bouest\b/u.test(expoRaw)) put("westFacing", true);
+  if (/\bnord\b/u.test(expoRaw)) put("northFacing", true);
   const mandate = textOf(ad, "type_mandat").toUpperCase();
   if (mandate) put("exclusive", mandate === "EXCLUSIF");
-  put("neighborhood", publicText(textOf(ad, "secteurs") || textOf(ad, "secteur"), 64, { singleLine: true, name: "secteurs" }));
+  const sectors = (textOf(ad, "secteurs") || textOf(ad, "secteur")).split(",").map((part) => part.replace(/\s*-\s*null\s*$/iu, "").trim()).filter((part) => part && !/^null$/iu.test(part));
+  const neighborhood = [...new Set(sectors)].join(", ");
+  if (neighborhood.length <= 64) put("neighborhood", publicText(neighborhood, 64, { singleLine: true, name: "secteurs" }));
   const payer = FEES_PAYERS[textOf(ad, "honorairesAChargeDe")];
-  if (transaction === "sale") {
+  if (sold) {
+    put("commercialStatus", "sold");
+  } else if (transaction === "sale") {
     put("feesPayer", payer);
     put("feesBuyerPercent", number2(ad, "honorairesPourcentageAcquereur", { max: 100 }));
     if (payer && payer !== "seller") put("priceExcludingBuyerFees", cents(number2(ad, "prixnetvendeur", { zeroIsAbsent: true })));
@@ -1569,7 +1602,7 @@ function mapAd(ad, who) {
     put("baseRent", cents(number2(ad, "loyer_base", { required: controlled, zeroIsAbsent: true })));
     put("referenceRent", cents(number2(ad, "loyer_reference_majore", { required: controlled, zeroIsAbsent: true })));
   }
-  const schedule = textOf(ad, "urlBaremeHono");
+  const schedule = sold ? "" : textOf(ad, "urlBaremeHono");
   if (schedule) {
     let url;
     try {
@@ -1581,8 +1614,9 @@ function mapAd(ad, who) {
     put("feeScheduleUrl", url.href);
   }
   const coOwnershipNode = childOf(ad, "copropriete");
-  const coproScope = coOwnershipNode?.children?.length ? coOwnershipNode : ad;
-  const coproFlag = coOwnershipNode?.children?.length ? true : safeFlag(ad, "copropriete");
+  const nested = Boolean(coOwnershipNode?.children.length);
+  const coproScope = nested ? coOwnershipNode : ad;
+  const coproFlag = nested ? true : safeFlag(ad, "copropriete");
   const lots = number2(coproScope, "copropriete_nb_lot", { integer: true, max: 1e6, zeroIsAbsent: true });
   const share = cents(number2(coproScope, "copropriete_quote_part", { zeroIsAbsent: true }));
   const syndicate = textOf(coproScope, "copropriete_statut_syndicat").toUpperCase();
@@ -1591,9 +1625,7 @@ function mapAd(ad, who) {
   else if (coproFlag === false) put("coOwnership", false);
   put("coOwnershipLots", lots);
   put("coOwnershipAnnualCharges", share);
-  if (details.coOwnership === true) {
-    put("coOwnershipProcedure", ["ALERTE", "REDRESSEMENT"].includes(syndicate) || safeguard === true);
-  }
+  if (details.coOwnership === true) put("coOwnershipProcedure", ["ALERTE", "REDRESSEMENT"].includes(syndicate) || safeguard === true);
   if (!["VI", "NS"].includes(energyLabel)) put("energyConsumption", number2(ad, "cons_energie", { integer: true, max: 1e7, zeroIsAbsent: true }));
   if (!["VI", "NS"].includes(gesLabel)) put("gesEmission", number2(ad, "emission_gaz", { integer: true, max: 1e7, zeroIsAbsent: true }));
   put("dpeDate", isoDate(textOf(ad, "date_diag_energie"), "date_diag_energie"));
@@ -1605,21 +1637,21 @@ function mapAd(ad, who) {
   if (year >= 2006 && year <= 2100 && details.energyCostMin !== void 0) put("energyCostReferenceDate", `${year}-01-01`);
   put("energyFinalConsumption", number2(ad, "valeurEnergieFinale", { integer: true, max: 1e7, zeroIsAbsent: true }));
   const extraDisclosures = [];
-  const chargeComment = publicText(textOf(ad, "chargesCommentaires"), 1e3, { singleLine: true });
+  const chargeComment = publicText(textOf(ad, "chargesCommentaires"), 1e3, { singleLine: true, name: "chargesCommentaires" });
   if (chargeComment) extraDisclosures.push(`Précisions sur les charges : ${chargeComment}.`);
   const erpFlag = safeFlag(ad, "risques_polution");
-  const erpDate = textOf(ad, "erp_date");
-  const erpComment = publicText(textOf(ad, "erp_commentaire"), 1e3, { singleLine: true });
+  const erpIso = isoDate(textOf(ad, "erp_date"), "erp_date");
+  const erpDate = erpIso ? erpIso.split("-").reverse().join("/") : "";
+  const erpComment = publicText(textOf(ad, "erp_commentaire"), 1e3, { singleLine: true, name: "erp_commentaire" });
   if (erpFlag !== void 0 || erpDate || erpComment) {
-    const erpParts = [
+    extraDisclosures.push(`${[
       erpFlag !== void 0 ? `Bien concerné par un état des risques et pollutions (ERP) : ${yesNo(erpFlag)}` : "État des risques et pollutions (ERP)",
       erpDate ? `établi le ${erpDate}` : "",
       erpComment ? `(${erpComment})` : ""
-    ].filter(Boolean);
-    extraDisclosures.push(`${erpParts.join(" ")}.`);
+    ].filter(Boolean).join(" ")}.`);
   }
   const virtualTourUrl = optionalWebUrl(textOf(ad, "visite_virtuelle") || textOf(ad, "uRLVisiteVirtuelle"), 256);
-  const priceLabel = transaction === "sale" ? money(price) : `Loyer : ${money(price)}${details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : ""}`;
+  const priceLabel = sold ? "Vendu" : transaction === "sale" ? money(price) : `Loyer : ${money(price)}${details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : ""}`;
   const images = childOf(ad, "images");
   const photos = (images ? childrenOf(images, "image") : []).map((image) => image.text.trim()).filter(Boolean).map((reference) => ({ url: photoUrl(reference), alt: "" }));
   if (photos.length > 40) fail2("HEKTOR_XML_TOO_MANY_PHOTOS");
@@ -1630,10 +1662,11 @@ function mapAd(ad, who) {
     propertyType,
     propertyTypeLabel,
     title: publicText(textOf(ad, "titre"), 180, { required: true, singleLine: true, name: "titre" }),
-    description: publicText(textOf(ad, "corps"), 15e3, { required: true, name: "corps" }),
+    // The agency's site shows <corps_impression>; <corps> is the text sent to the portals.
+    description: publicText(textOf(ad, "corps_impression") || textOf(ad, "corps"), 15e3, { required: true, name: "corps" }),
     city: publicText(childOf(ad, "ville")?.attributes.humanName || textOf(ad, "ville"), 50, { required: true, singleLine: true, name: "ville" }),
     postalCode,
-    price,
+    ...sold ? {} : { price },
     priceLabel,
     area: number2(ad, "surface_habitable", { required: residential, max: 1e7, zeroIsAbsent: true }),
     rooms: number2(ad, "nb_pieces", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? number2(ad, "nb_piece", { required: residential, integer: true, max: 1e3, zeroIsAbsent: true }),
@@ -1654,7 +1687,7 @@ function mapAd(ad, who) {
     propertyTypeLabel,
     postalCode,
     city: item.city,
-    price,
+    ...sold ? {} : { price },
     reference: item.reference,
     area: item.area,
     rooms: item.rooms,
@@ -1691,12 +1724,13 @@ function mapHektorXml(bytes, context, options) {
     const who = identity(ad, options);
     if (seen.has(who.sourceId)) fail2("HEKTOR_XML_DUPLICATE_ID");
     seen.add(who.sourceId);
-    if (who.status !== AVAILABLE_STATUS) {
+    const sold = who.status === SOLD_STATUS && TRANSACTIONS[textOf(ad, "type_offre_code")] === "sale";
+    if (who.status !== AVAILABLE_STATUS && !sold) {
       notPublished[who.status] = (notPublished[who.status] || 0) + 1;
       continue;
     }
     try {
-      items.push(mapAd(ad, who));
+      items.push(mapAd(ad, who, sold));
     } catch (error) {
       if (!hold || !holdable(error)) throw error;
       held.push({
@@ -3030,7 +3064,7 @@ function createMediaUrlCache({
       return state(key, "failed");
     }
     if (info.opStatus !== "READY") return state(key, "pending");
-    if (info.fileUrl !== record.fileUrl) record = { ...record, fileUrl: info.fileUrl, status: record.status === "ready" ? "pending" : record.status };
+    if (info.fileUrl !== record.fileUrl && info.fileUrl.includes("#")) record = { ...record, fileUrl: info.fileUrl, status: record.status === "ready" ? "pending" : record.status };
     if (info.mediaType !== "image" || !MIME_TYPES3.has(info.mimeType) || info.isPrivate !== false || identity2.sourceMimeType && info.mimeType !== identity2.sourceMimeType || !Number.isSafeInteger(info.sizeInBytes) || info.sizeInBytes <= 0 || info.sizeInBytes > maxImageBytes || !Number.isSafeInteger(info.width) || info.width <= 0 || !Number.isSafeInteger(info.height) || info.height <= 0) fail7("MEDIA_INVALID_FILE_INFO");
     const url = await call2(resolvePublicUrl, "MEDIA_URL_RESOLUTION_FAILED", record.fileUrl);
     if (url !== `https://static.wixstatic.com/media/${imageId(record.fileUrl)}`) fail7("MEDIA_INVALID_PUBLIC_URL");
@@ -3279,6 +3313,14 @@ function parsePositiveInt(value) {
   const num = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
   return Number.isSafeInteger(num) && num > 0 ? num : null;
 }
+function imageFacts(image) {
+  if (typeof image === "string") {
+    const fragment = new URLSearchParams(image.split("#")[1] || "");
+    return { width: parsePositiveInt(fragment.get("originWidth")), height: parsePositiveInt(fragment.get("originHeight")), format: "" };
+  }
+  if (!object5(image)) return { width: null, height: null, format: "" };
+  return { width: parsePositiveInt(image.width), height: parsePositiveInt(image.height), format: String(image.format || "").toUpperCase() };
+}
 async function readMediaFileInfo(fileUrl, { getFileDescriptor: getFileDescriptor2 }) {
   const match = typeof fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s#]+(?:#[^\s]*)?$/.exec(fileUrl);
   if (!match) fail8("MEDIA_INVALID_FILE_URI");
@@ -3290,23 +3332,16 @@ async function readMediaFileInfo(fileUrl, { getFileDescriptor: getFileDescriptor
   }
   const baseUri = fileUrl.split("#")[0];
   if (descriptor.operationStatus !== "READY") {
-    return {
-      fileUrl: baseUri,
-      opStatus: descriptor.operationStatus,
-      readinessSource: "media-v2-operation-status"
-    };
+    return { fileUrl: baseUri, opStatus: descriptor.operationStatus, readinessSource: "media-v2-operation-status" };
   }
-  if (descriptor.private === true || (descriptor.state && descriptor.state !== "OK") || String(descriptor.mediaType || "").toUpperCase() !== "IMAGE") {
+  if (descriptor.private === true || descriptor.state && descriptor.state !== "OK" || String(descriptor.mediaType || "").toUpperCase() !== "IMAGE") {
     console.info("HEKTOR_MEDIA_DESCRIPTOR_DEBUG", JSON.stringify({ fileId, descriptor }));
     fail8("MEDIA_INVALID_FILE_DESCRIPTOR");
   }
   const size = parsePositiveInt(descriptor.sizeInBytes) ?? 1;
-  const imageMeta = descriptor.media?.image?.image || descriptor.media?.image || descriptor.image || descriptor;
-  const width = parsePositiveInt(imageMeta?.width);
-  const height = parsePositiveInt(imageMeta?.height);
+  const { width, height, format } = imageFacts(descriptor.media?.image?.image);
   const ext = fileId.split(".").pop()?.toLowerCase() || "";
-  const format = String(imageMeta?.format || "").toUpperCase();
-  const mimeType = (typeof descriptor.mimeType === "string" && descriptor.mimeType) || FORMAT_TO_MIME[format] || EXT_TO_MIME[ext] || "image/jpeg";
+  const mimeType = typeof descriptor.mimeType === "string" && descriptor.mimeType || FORMAT_TO_MIME[format] || EXT_TO_MIME[ext] || "image/jpeg";
   const resolvedUri = width && height ? `${baseUri}#originWidth=${width}&originHeight=${height}` : baseUri;
   return {
     fileUrl: resolvedUri,
@@ -3324,10 +3359,7 @@ async function readMediaFileInfo(fileUrl, { getFileDescriptor: getFileDescriptor
 // velo/backend/hektor-media.js
 var getFileDescriptor = elevate2(files.getFileDescriptor);
 function readHektorMediaInfo(fileUrl) {
-  return readMediaFileInfo(fileUrl, {
-    getFileInfo: (value) => mediaManager.getFileInfo(value),
-    getFileDescriptor
-  });
+  return readMediaFileInfo(fileUrl, { getFileDescriptor });
 }
 function createHektorMediaStore({
   cacheCollection = "HektorMediaCache",
@@ -3567,7 +3599,7 @@ function toPublicItem(item, { idFor: idFor2, hash: hash2, publicSource: publicSo
     publicDetails: item.publicDetails || {},
     city: item.city,
     postalCode: item.postalCode,
-    price: item.price,
+    price: item.price ?? null,
     priceLabel: item.priceLabel,
     area: item.area ?? null,
     rooms: item.rooms ?? null,

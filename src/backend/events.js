@@ -5,6 +5,7 @@ import wixData from "wix-data";
 var fail = (code) => {
   throw new Error(code);
 };
+var mediaId = (value) => typeof value === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\//.exec(value)?.[1] || value;
 var object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 var hex = (value) => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 var nativeImage = (value) => typeof value === "string" && /^wix:image:\/\/v1\/[A-Za-z0-9_~.\-]+\/[^\s?#]+(?:#[^\s]*)?$/u.test(value);
@@ -53,10 +54,10 @@ function createMediaImportReceiptHandler({ lookupIntent, lookupReceipt, insertRe
     };
     const intent = await call(lookupIntent, "MEDIA_RECEIPT_INTENT_READ_FAILED", receipt.key);
     if (!object(intent)) fail("MEDIA_RECEIPT_INTENT_NOT_FOUND");
-    if (intent.key !== receipt.key || intent.operationId !== receipt.operationId || intent.sourceUrl !== receipt.sourceUrl || intent.version !== receipt.version || intent.fileUrl !== void 0 && intent.fileUrl !== receipt.fileUrl || intent.sourceMimeType !== void 0 && intent.sourceMimeType !== info.mimeType) {
+    if (intent.key !== receipt.key || intent.operationId !== receipt.operationId || intent.sourceUrl !== receipt.sourceUrl || intent.version !== receipt.version || intent.fileUrl !== void 0 && mediaId(intent.fileUrl) !== mediaId(receipt.fileUrl) || intent.sourceMimeType !== void 0 && intent.sourceMimeType !== info.mimeType) {
       fail("MEDIA_RECEIPT_INTENT_CONFLICT");
     }
-    if (intent.fileUrl === receipt.fileUrl && ["pending", "ready"].includes(intent.status)) {
+    if (intent.fileUrl !== void 0 && mediaId(intent.fileUrl) === mediaId(receipt.fileUrl) && ["pending", "ready"].includes(intent.status)) {
       return { status: "not-needed" };
     }
     const existing = await call(lookupReceipt, "MEDIA_RECEIPT_READ_FAILED", receipt.operationId);
