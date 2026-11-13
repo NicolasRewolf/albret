@@ -3346,7 +3346,9 @@ function createHektorMediaStore({
         operationId,
         elapsedMs: Date.now() - started,
         hasFileUrl: Boolean(result?.fileUrl),
-        status: result?.opStatus || "unknown"
+        status: result?.opStatus || "unknown",
+        // Shape of the answer only (field names), to diagnose an answer without a file URL.
+        shape: result && typeof result === "object" ? Object.keys(result).slice(0, 20) : typeof result
       }));
       return result;
     },
