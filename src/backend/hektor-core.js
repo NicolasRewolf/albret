@@ -1196,13 +1196,22 @@ function failAt(code, field) {
   throw error;
 }
 var TRANSACTIONS = { 0: "sale", 10: "sale", 2: "rent", 11: "rent" };
-var PROPERTY_TYPES = new Map([
+var TYPE_LABELS = [
+  [/\b(?:parking|garage|box|cave|emplacement)/u, "autre"],
+  [/\bterrain/u, "terrain"],
+  [/\bbureau/u, "bureau"],
+  [/\b(?:local|commerce|fonds de commerce|murs|entrepot|cession)/u, "local"],
+  [/\b(?:maison|villa|ferme|fermette|mas|bastide|chalet|propriete|bungalow|echoppe)\b/u, "maison"],
+  [/\b(?:appartement|studio|duplex|triplex|penthouse|rez de jardin|chambre)\b/u, "appartement"]
+];
+var TYPE_CODES = new Map([
   ...[1, 10, 16, 21, 24, 30, 32, 33, 34, 35, 36, 38, 39].map((code) => [code, "maison"]),
   ...[2, 4, 17, 25, 40, 41, 42].map((code) => [code, "appartement"]),
   ...[5, 43, 44, 45, 2315].map((code) => [code, "terrain"]),
   [2310, "bureau"],
   ...[22, 231, 232, 235, 2313, 2314, 2316, 2317].map((code) => [code, "local"])
 ]);
+var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
 var AVAILABLE_STATUS = 2;
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
@@ -1419,9 +1428,8 @@ function identity(ad, options) {
 function mapAd(ad, who) {
   const transaction = TRANSACTIONS[textOf(ad, "type_offre_code")];
   if (!transaction) fail2("HEKTOR_XML_UNSUPPORTED_TRANSACTION");
-  const typeCode = number2(ad, "type_bien_code", { required: true, integer: true, max: 99999 });
-  const propertyType = PROPERTY_TYPES.get(typeCode) || "autre";
   const propertyTypeLabel = publicText(textOf(ad, "type_bien"), 80, { required: true, singleLine: true, name: "type_bien" });
+  const propertyType = TYPE_LABELS.find(([pattern]) => pattern.test(plainLabel(propertyTypeLabel)))?.[1] || TYPE_CODES.get(number2(ad, "type_bien_code", { integer: true, max: 99999 })) || "autre";
   const residential = ["appartement", "maison"].includes(propertyType);
   const postalCode = textOf(ad, "cp");
   if (!/^\d{5}$/u.test(postalCode)) fail2("HEKTOR_XML_INVALID_POSTAL_CODE");
@@ -1467,7 +1475,8 @@ function mapAd(ad, who) {
       if (!CHARGE_TERMS[terms]) fail2("HEKTOR_XML_INVALID_CHARGE_TERMS");
       put("chargeTerms", CHARGE_TERMS[terms]);
     }
-    put("rentChargesIncluded", flag(ad, "charge_comprise") === true);
+    const included = textOf(ad, "charge_comprise").toUpperCase();
+    put("rentChargesIncluded", ["", "0", "NON"].includes(included) ? false : ["1", "OUI"].includes(included) ? true : void 0);
     put("deposit", cents(number2(ad, "depotGarantie", { zeroIsAbsent: true })));
     put("rentControlled", flag(ad, "soumis_encadrement_loyer"));
     const controlled = residential && details.rentControlled === true;
@@ -1505,7 +1514,7 @@ function mapAd(ad, who) {
   const year = number2(ad, "dpe_annee_ref_estim", { integer: true, max: 9999 });
   if (year >= 2006 && year <= 2100 && details.energyCostMin !== void 0) put("energyCostReferenceDate", `${year}-01-01`);
   put("energyFinalConsumption", number2(ad, "valeurEnergieFinale", { integer: true, max: 1e7, zeroIsAbsent: true }));
-  const priceLabel = transaction === "sale" ? money(price) : `Loyer : ${money(price)} ${details.rentChargesIncluded ? "charges comprises" : "hors charges"}`;
+  const priceLabel = transaction === "sale" ? money(price) : `Loyer : ${money(price)}${details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : ""}`;
   const images = childOf(ad, "images");
   const photos = (images ? childrenOf(images, "image") : []).map((image) => image.text.trim()).filter(Boolean).map((reference) => ({ url: photoUrl(reference), alt: "" }));
   if (photos.length > 40) fail2("HEKTOR_XML_TOO_MANY_PHOTOS");

@@ -269,10 +269,9 @@ function rentalFor(item, details, transaction, financialRows) {
   detail('referenceRent', 'Loyer de référence majoré', monthly);
   detail('rentSupplement', 'Complément de loyer', monthly);
 
-  // Poliris 4.12, colonne 11 : charges et complément éventuel déjà compris.
-  // Hors flux Hektor, seul un indicateur CC explicite autorise cette qualification.
-  const chargesIncluded = details.rentChargesIncluded === true
-    || (item.source === 'hektor' && details.rentChargesIncluded !== false);
+  // Le loyer n'est qualifié que si le flux le dit : charges comprises, hors
+  // charges, ou ni l'un ni l'autre (locations professionnelles).
+  const chargesIncluded = details.rentChargesIncluded === true;
   const monthlyCharges = ['monthly_flat', 'monthly_provision_annual_adjustment'].includes(details.chargeTerms);
   if (chargesIncluded && finite(item.price) && finite(details.rentCharges) && monthlyCharges
       && item.price >= details.rentCharges) {
