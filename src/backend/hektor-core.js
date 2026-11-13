@@ -3676,7 +3676,8 @@ async function synchronize(deps, options = {}) {
     const fingerprint2 = deps.hash(snapshot);
     if (state) {
       if (Date.parse(snapshot.generatedAt) < Date.parse(state.generatedAt)) throw new Error("OUT_OF_ORDER_SNAPSHOT");
-      if ((snapshot.snapshotId === state.snapshotId || snapshot.generatedAt === state.generatedAt) && fingerprint2 !== state.fingerprint) throw new Error("SNAPSHOT_CONFLICT");
+      const sameReader = (state.readerVersion ?? null) === (options.readerVersion ?? null);
+      if (sameReader && (snapshot.snapshotId === state.snapshotId || snapshot.generatedAt === state.generatedAt) && fingerprint2 !== state.fingerprint) throw new Error("SNAPSHOT_CONFLICT");
     }
     const existing = await deps.listPublic();
     const plan = planSnapshot(snapshot, existing, { ...deps, ...options });
@@ -3696,7 +3697,8 @@ async function synchronize(deps, options = {}) {
       generatedAt: snapshot.generatedAt,
       fingerprint: fingerprint2,
       completedAt: /* @__PURE__ */ new Date(),
-      publicCount: plan.summary.published
+      publicCount: plan.summary.published,
+      ...options.readerVersion !== void 0 ? { readerVersion: options.readerVersion } : {}
     });
     result.status = "applied";
     await deps.logRun(result);
@@ -3717,7 +3719,6 @@ function deliveryIdentity(source) {
   return {
     fileSize: source.size,
     fileModifiedAt: new Date(source.sourceModifiedAt).toISOString(),
-    readerVersion: READER_VERSION,
     ...typeof source.sha256 === "string" && /^[a-f0-9]{64}$/.test(source.sha256) ? { fileSha256: source.sha256 } : {}
   };
 }
@@ -3759,7 +3760,7 @@ async function runFeedPass(deps, { force = false, allowMediaWrites = false, limi
       },
       readSnapshot: async () => fed.snapshot,
       saveState: (state) => deps.saveState({ ...state, ...deliveryIdentity(fed.source) })
-    }, { ...limits, dryRun: false });
+    }, { ...limits, dryRun: false, readerVersion: READER_VERSION });
     return { ...result, ...warnings };
   } finally {
     await deps.releaseLock(owner);
@@ -4105,7 +4106,7 @@ async function runHektorSync({ dryRun = true, approvedRemovalFingerprint = "" } 
       return fed.snapshot;
     },
     saveState: (state) => saveState({ ...state, ...deliveryIdentity(source) })
-  }, { ...HEKTOR, dryRun, approvedRemovalFingerprint });
+  }, { ...HEKTOR, dryRun, approvedRemovalFingerprint, readerVersion: READER_VERSION });
 }
 async function readHektorSyncStatus() {
   const [state, lock, runs, runtime, heartbeat] = await Promise.all([
