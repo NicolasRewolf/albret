@@ -1275,6 +1275,7 @@ var TYPE_CODES = new Map([
 var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
 var AVAILABLE_STATUS = 2;
 var SOLD_STATUS = 5;
+var READER_VERSION = "2026-11-13.2";
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
 var FEE_LABELS = { buyer: "acquéreur", seller: "vendeur", both: "acquéreur et vendeur" };
@@ -3716,12 +3717,13 @@ function deliveryIdentity(source) {
   return {
     fileSize: source.size,
     fileModifiedAt: new Date(source.sourceModifiedAt).toISOString(),
+    readerVersion: READER_VERSION,
     ...typeof source.sha256 === "string" && /^[a-f0-9]{64}$/.test(source.sha256) ? { fileSha256: source.sha256 } : {}
   };
 }
 function knownDelivery(state) {
   const modified = state?.fileModifiedAt instanceof Date ? state.fileModifiedAt.getTime() : Date.parse(state?.fileModifiedAt);
-  if (!Number.isSafeInteger(state?.fileSize) || state.fileSize <= 0 || !Number.isFinite(modified)) return void 0;
+  if (!Number.isSafeInteger(state?.fileSize) || state.fileSize <= 0 || !Number.isFinite(modified) || state.readerVersion !== READER_VERSION) return void 0;
   return { size: state.fileSize, sourceModifiedAt: new Date(modified).toISOString() };
 }
 async function runFeedPass(deps, { force = false, allowMediaWrites = false, limits = {} } = {}) {
