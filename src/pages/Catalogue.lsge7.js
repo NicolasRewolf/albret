@@ -10,7 +10,7 @@ import wixData from 'wix-data';
 
 const DATASET_ID = '#dynamicDataset';
 const OPTIONS = {
-  transactionFilter: [['', 'Tous les biens'], ['sale', 'À vendre'], ['rent', 'À louer']],
+  transactionFilter: [['', 'Tous les biens'], ['sale', 'À vendre'], ['rent', 'À louer'], ['sold', 'Biens vendus']],
   typeFilter: [['', 'Tous les types'], ['maison', 'Maison'], ['appartement', 'Appartement'],
     ['terrain', 'Terrain'], ['bureau', 'Bureau'], ['local', 'Local'], ['autre', 'Autre']],
   sortFilter: [['newest', 'Plus récentes'], ['priceAsc', 'Prix croissant'], ['priceDesc', 'Prix décroissant']],
@@ -238,7 +238,14 @@ function makeFilter(criteria) {
   // setFilter remplace les filtres Studio : conserver cette règle à chaque appel,
   // y compris Réinitialiser. Cela ne modifie aucun statut CMS et ne publie rien.
   let filter = wixData.filter().eq('_publishStatus', 'PUBLISHED');
-  if (criteria.transaction) filter = filter.eq('transaction', criteria.transaction);
+  // Un bien vendu arrive de l'import sans prix. Il n'apparaît que sous « Biens
+  // vendus », comme la rubrique du même nom sur le site actuel de l'agence ;
+  // les autres choix, « Tous les biens » compris, ne montrent que les biens disponibles.
+  if (criteria.transaction === 'sold') filter = filter.isEmpty('price');
+  else {
+    filter = filter.isNotEmpty('price');
+    if (criteria.transaction) filter = filter.eq('transaction', criteria.transaction);
+  }
   if (criteria.propertyType) filter = filter.eq('propertyType', criteria.propertyType);
   if (criteria.city) filter = filter.contains('city', criteria.city);
   if (criteria.maxPrice !== undefined) filter = filter.le('price', criteria.maxPrice);
