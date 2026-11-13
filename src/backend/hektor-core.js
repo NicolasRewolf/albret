@@ -1190,6 +1190,11 @@ var childrenOf = (node, name) => node.children.filter((child) => child.name === 
 var textOf = (node, name) => (childOf(node, name)?.text ?? "").trim();
 
 // velo/backend/lib/hektor-xml.js
+function failAt(code, field) {
+  const error = new BridgeError(code);
+  error.field = field;
+  throw error;
+}
 var TRANSACTIONS = { 0: "sale", 10: "sale", 2: "rent", 11: "rent" };
 var PROPERTY_TYPES = new Map([
   ...[1, 10, 16, 21, 24, 30, 32, 33, 34, 35, 36, 38, 39].map((code) => [code, "maison"]),
@@ -1261,7 +1266,15 @@ var ENTITIES = {
 };
 var BLOCK_END = /<\/(?:p|div|li|ul|ol|h[1-6])\s*>|<br\s*\/?>/giu;
 var INLINE = /<\/?(?:p|div|ul|ol|strong|b|em|i|u|span|h[1-6])(?:\s+[a-z-]+\s*=\s*(?:"[^"<>]*"|'[^'<>]*'))*\s*\/?>/giu;
-function publicText(raw, max, { required = false, singleLine = false } = {}) {
+function publicText(raw, max, { required = false, singleLine = false, name } = {}) {
+  try {
+    return cleanText(raw, max, required, singleLine);
+  } catch (error) {
+    if (error instanceof BridgeError && name) error.field = name;
+    throw error;
+  }
+}
+function cleanText(raw, max, required, singleLine) {
   let value = raw.replace(/\r\n?/gu, "\n").replace(BLOCK_END, "\n").replace(/<li(?:\s[^<>]*)?>/giu, "- ").replace(INLINE, "");
   if (/<[A-Za-z/!?]/u.test(value)) fail2("HEKTOR_XML_INVALID_PUBLIC_TEXT");
   value = value.replace(/&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]{1,15});/gu, (match, body) => {
@@ -1286,15 +1299,15 @@ function publicText(raw, max, { required = false, singleLine = false } = {}) {
 function number2(ad, name, { required = false, integer: integer2 = false, max = 1e10, zeroIsAbsent = false } = {}) {
   const raw = textOf(ad, name);
   if (!raw) {
-    if (required) fail2("HEKTOR_XML_REQUIRED_NUMBER");
+    if (required) failAt("HEKTOR_XML_REQUIRED_NUMBER", name);
     return void 0;
   }
-  if (!/^\d+(?:\.\d+)?$/u.test(raw)) fail2("HEKTOR_XML_INVALID_NUMBER");
+  if (!/^\d+(?:\.\d+)?$/u.test(raw)) failAt("HEKTOR_XML_INVALID_NUMBER", name);
   const value = Number(raw);
-  if (!Number.isFinite(value) || value > max) fail2("HEKTOR_XML_INVALID_NUMBER");
-  if (integer2 && !Number.isSafeInteger(value)) fail2("HEKTOR_XML_INVALID_NUMBER");
+  if (!Number.isFinite(value) || value > max) failAt("HEKTOR_XML_INVALID_NUMBER", name);
+  if (integer2 && !Number.isSafeInteger(value)) failAt("HEKTOR_XML_INVALID_NUMBER", name);
   if (zeroIsAbsent && value === 0) {
-    if (required) fail2("HEKTOR_XML_REQUIRED_NUMBER");
+    if (required) failAt("HEKTOR_XML_REQUIRED_NUMBER", name);
     return void 0;
   }
   return value;
@@ -1305,21 +1318,21 @@ function flag(ad, name) {
   if (!raw) return void 0;
   if (raw === "1" || raw === "OUI") return true;
   if (raw === "0" || raw === "NON") return false;
-  fail2("HEKTOR_XML_INVALID_BOOLEAN");
+  failAt("HEKTOR_XML_INVALID_BOOLEAN", name);
 }
-function isoDate(raw) {
+function isoDate(raw, name) {
   if (!raw || /^0000-00-00/u.test(raw)) return void 0;
   const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(raw) || /^(\d{2})\/(\d{2})\/(\d{4})$/u.exec(raw);
-  if (!match) fail2("HEKTOR_XML_INVALID_DATE");
+  if (!match) failAt("HEKTOR_XML_INVALID_DATE", name);
   const iso2 = match[1].length === 4 ? `${match[1]}-${match[2]}-${match[3]}` : `${match[3]}-${match[2]}-${match[1]}`;
   const date = /* @__PURE__ */ new Date(`${iso2}T00:00:00.000Z`);
-  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== iso2) fail2("HEKTOR_XML_INVALID_DATE");
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== iso2) failAt("HEKTOR_XML_INVALID_DATE", name);
   return iso2;
 }
 function energyClass(ad, name) {
   const raw = textOf(ad, name).toUpperCase();
   if (!raw) return void 0;
-  if (!/^[A-G]$/u.test(raw)) fail2("HEKTOR_XML_INVALID_ENERGY_CLASS");
+  if (!/^[A-G]$/u.test(raw)) failAt("HEKTOR_XML_INVALID_ENERGY_CLASS", name);
   return raw;
 }
 function photoUrl(raw) {
@@ -1408,7 +1421,7 @@ function mapAd(ad, who) {
   if (!transaction) fail2("HEKTOR_XML_UNSUPPORTED_TRANSACTION");
   const typeCode = number2(ad, "type_bien_code", { required: true, integer: true, max: 99999 });
   const propertyType = PROPERTY_TYPES.get(typeCode) || "autre";
-  const propertyTypeLabel = publicText(textOf(ad, "type_bien"), 80, { required: true, singleLine: true });
+  const propertyTypeLabel = publicText(textOf(ad, "type_bien"), 80, { required: true, singleLine: true, name: "type_bien" });
   const residential = ["appartement", "maison"].includes(propertyType);
   const postalCode = textOf(ad, "cp");
   if (!/^\d{5}$/u.test(postalCode)) fail2("HEKTOR_XML_INVALID_POSTAL_CODE");
@@ -1438,7 +1451,7 @@ function mapAd(ad, who) {
   put("featured", flag(ad, "coup_de_coeur"));
   const mandate = textOf(ad, "type_mandat").toUpperCase();
   if (mandate) put("exclusive", mandate === "EXCLUSIF");
-  put("neighborhood", publicText(textOf(ad, "secteurs") || textOf(ad, "secteur"), 64, { singleLine: true }));
+  put("neighborhood", publicText(textOf(ad, "secteurs") || textOf(ad, "secteur"), 64, { singleLine: true, name: "secteurs" }));
   const payer = FEES_PAYERS[textOf(ad, "honorairesAChargeDe")];
   if (transaction === "sale") {
     put("feesPayer", payer);
@@ -1484,7 +1497,7 @@ function mapAd(ad, who) {
   }
   if (!["VI", "NS"].includes(energyLabel)) put("energyConsumption", number2(ad, "cons_energie", { integer: true, max: 1e7, zeroIsAbsent: true }));
   if (!["VI", "NS"].includes(gesLabel)) put("gesEmission", number2(ad, "emission_gaz", { integer: true, max: 1e7, zeroIsAbsent: true }));
-  put("dpeDate", isoDate(textOf(ad, "date_diag_energie")));
+  put("dpeDate", isoDate(textOf(ad, "date_diag_energie"), "date_diag_energie"));
   if (details.dpeDate) put("dpeVersion", details.dpeDate < "2021-07-01" ? "DPE_v01-2011" : "DPE_v07-2021");
   put("energyCostMin", cents(number2(ad, "dpe_couts_min_estim", { zeroIsAbsent: true })));
   put("energyCostMax", cents(number2(ad, "dpe_couts_max_estim", { zeroIsAbsent: true })));
@@ -1502,9 +1515,9 @@ function mapAd(ad, who) {
     transaction,
     propertyType,
     propertyTypeLabel,
-    title: publicText(textOf(ad, "titre"), 180, { required: true, singleLine: true }),
-    description: publicText(textOf(ad, "corps"), 15e3, { required: true }),
-    city: publicText(childOf(ad, "ville")?.attributes.humanName || textOf(ad, "ville"), 50, { required: true, singleLine: true }),
+    title: publicText(textOf(ad, "titre"), 180, { required: true, singleLine: true, name: "titre" }),
+    description: publicText(textOf(ad, "corps"), 15e3, { required: true, name: "corps" }),
+    city: publicText(childOf(ad, "ville")?.attributes.humanName || textOf(ad, "ville"), 50, { required: true, singleLine: true, name: "ville" }),
     postalCode,
     price,
     priceLabel,
@@ -1571,7 +1584,12 @@ function mapHektorXml(bytes, context, options) {
       items.push(mapAd(ad, who));
     } catch (error) {
       if (!hold || !holdable(error)) throw error;
-      held.push({ sourceId: who.sourceId, reference: who.reference, code: error.message });
+      held.push({
+        sourceId: who.sourceId,
+        reference: who.reference,
+        code: error.message,
+        .../^[A-Za-z_]{1,40}$/u.test(error.field || "") ? { field: error.field } : {}
+      });
     }
   }
   const schedules = new Set(items.map((item) => item.publicDetails.feeScheduleUrl).filter(Boolean));
@@ -1636,7 +1654,7 @@ function inspectHektorXml(bytes, { expectedAgencyKey, allowedHosts = [], limits 
       mapping = {
         accepted: mapped.items.length,
         acceptedByTransaction: Object.fromEntries([...mapped.items.reduce((map, item) => count(map, item.transaction), /* @__PURE__ */ new Map())]),
-        held: mapped.held.map(({ reference, code }) => ({ reference, code })),
+        held: mapped.held.map(({ reference, code, field }) => ({ reference, code, ...field ? { field } : {} })),
         notPublishedByStatus: mapped.notPublishedByStatus
       };
     } catch (error) {
@@ -1718,7 +1736,7 @@ function createHektorArchiveParser(yauzl3) {
       })),
       // The delivery attaches no image: every photo is a URL to rehost.
       mediaEntries: /* @__PURE__ */ new Map(),
-      held: held.map(({ reference, code }) => ({ reference, code })),
+      held: held.map(({ reference, code, field }) => ({ reference, code, ...field ? { field } : {} })),
       // Delivered listings that are not available (sold, let, closed), by status.
       notPublishedByStatus
     };
@@ -1734,10 +1752,11 @@ function summarizePreparedFeed(draft) {
     attachedImageBytes: [...draft.mediaEntries.values()].reduce((total, bytes) => total + bytes.length, 0),
     photoMode: draft.photoMode,
     ...draft.notPublishedByStatus && Object.keys(draft.notPublishedByStatus).length ? { notPublishedByStatus: { ...draft.notPublishedByStatus } } : {},
-    // Dossier numbers and fault codes only, so the agency can fix them in Hektor.
+    // Dossier numbers, fault codes and XML tag names only, so the agency can
+    // fix them in Hektor.
     ...Array.isArray(draft.held) && draft.held.length ? {
       heldListingCount: draft.held.length,
-      heldListings: draft.held.slice(0, 50).map(({ reference, code }) => ({ reference, code }))
+      heldListings: draft.held.slice(0, 50).map(({ reference, code, field }) => ({ reference, code, ...field ? { field } : {} }))
     } : {}
   };
 }
