@@ -125,7 +125,7 @@ const LAYOUT = [
   ['neighborhood', 'Quartier'], ['rooms', 'Pièces', integer], ['bedrooms', 'Chambres', integer],
   ['floor', 'Étage', floor], ['totalFloors', 'Étages de l’immeuble', integer],
   ['levels', 'Niveaux', positiveInteger], ['sharedWalls', 'Murs mitoyens'],
-  ['constructionYear', 'Année de construction', year], ['propertyTax', 'Taxe foncière annuelle', money], ['bathrooms', 'Salles de bains', integer],
+  ['constructionYear', 'Année de construction', year], ['bathrooms', 'Salles de bains', integer],
   ['showerRooms', 'Salles d’eau', integer], ['toilets', 'WC', integer], ['balconies', 'Balcons', integer],
   ['terraces', 'Terrasses', integer], ['parkingSpaces', 'Places de parking', integer],
   ['garageSpaces', 'Places de garage', integer], ['kitchenLabel', 'Cuisine'],
@@ -218,6 +218,7 @@ const SALE_FINANCIAL = [
     finite(value) && value <= 100 ? `${number(value)} %` : ''],
   ['priceExcludingBuyerFees', 'Prix hors honoraires acquéreur', money],
   ['priceExcludingTax', 'Prix hors taxes', boolean],
+  ['propertyTax', 'Taxe foncière annuelle', money],
 ];
 const RENT_FINANCIAL = [
   ['baseRent', 'Loyer de base hors charges', money], ['rentCharges', 'Charges locataire transmises', money],

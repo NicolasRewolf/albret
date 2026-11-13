@@ -706,7 +706,7 @@ var DETAIL_ENUMS = {
   // A sold sale stays on the site as a reference, without its price or fees.
   commercialStatus: ["sold"]
 };
-var SOLD_FORBIDDEN = ["feesPayer", "feesBuyerPercent", "priceExcludingBuyerFees", "feeScheduleUrl"];
+var SOLD_FORBIDDEN = ["feesPayer", "feesBuyerPercent", "priceExcludingBuyerFees", "feeScheduleUrl", "propertyTax"];
 function publicDetails(value) {
   if (value === void 0) return {};
   if (!object(value)) fail("INVALID_PUBLIC_DETAILS");
@@ -1280,7 +1280,7 @@ var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, 
 var GEORISQUES_MENTION = "Les informations sur les risques auxquels ce bien est exposé sont disponibles sur le site Géorisques : www.georisques.gouv.fr.";
 var AVAILABLE_STATUS = 2;
 var SOLD_STATUS = 5;
-var READER_VERSION = "2026-11-13.3";
+var READER_VERSION = "2026-11-14.1";
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
 var FEE_LABELS = { buyer: "acquéreur", seller: "vendeur", both: "acquéreur et vendeur" };
@@ -1574,7 +1574,6 @@ function mapAd(ad, who, sold = false) {
       put(key, shown.charAt(0).toUpperCase() + shown.slice(1));
     }
   }
-  if (transaction === "sale") put("propertyTax", cents(number2(ad, "foncier", { zeroIsAbsent: true })));
   const viewRaw = plainLabel(textOf(ad, "vue"));
   if (viewRaw) {
     if (["1", "oui"].includes(viewRaw) || /\b(?:degagee|panoramique|mer|ocean|parc|jardin|montagne)\b/u.test(viewRaw)) put("clearView", true);
@@ -1595,6 +1594,7 @@ function mapAd(ad, who, sold = false) {
   if (sold) {
     put("commercialStatus", "sold");
   } else if (transaction === "sale") {
+    put("propertyTax", cents(number2(ad, "foncier", { zeroIsAbsent: true })));
     put("feesPayer", payer);
     put("feesBuyerPercent", number2(ad, "honorairesPourcentageAcquereur", { max: 100 }));
     if (payer && payer !== "seller") put("priceExcludingBuyerFees", cents(number2(ad, "prixnetvendeur", { zeroIsAbsent: true })));
