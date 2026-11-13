@@ -321,7 +321,7 @@ function rentalFor(item, details, transaction, financialRows) {
 
 function rentalLegalTextFor(item, details, view) {
   if (item.source !== 'hektor' || view.transaction !== 'rent') return view.legalText;
-  // Correspondances exactes de disclosure() dans poliris-csv.js. Une mention
+  // Correspondances exactes de disclosure() dans hektor-xml.js. Une mention
   // différente, libre ou sans représentation visible reste conservée.
   const yesNo = value => value === true ? 'oui' : value === false ? 'non' : '';
   const count = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : '';
