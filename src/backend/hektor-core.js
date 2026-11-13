@@ -70,7 +70,10 @@ var HEKTOR = Object.freeze({
     // Sized for the 60 write requests a minute of the free plan, worst case:
     // 2 grouped writes per chunk + one receipt per photo if every media event
     // arrives before its chunk is recorded + lock, log and state ≈ 50.
-    maxOperationsPerRun: 40,
+    // 8 since 13 November 2026: on the unpublished site a manual run is one web
+    // request, cut at 14 s on the free plan. The first real run started 20
+    // imports, was cut, and left them without an answer (MEDIA_RECOVERY_REQUIRED).
+    maxOperationsPerRun: 8,
     maxRunMs: 8e3,
     remote: Object.freeze({
       enabled: true,
@@ -88,7 +91,7 @@ var HEKTOR = Object.freeze({
       allowedHosts: Object.freeze(["agencealbret.staticlbi.com"]),
       // New photos are imported in chunks: two grouped CMS writes per chunk,
       // whatever its size.
-      batchSize: 20,
+      batchSize: 8,
       concurrency: 5,
       maxRequests: 100,
       maxDownloadedBytes: 32 * 1024 * 1024,
