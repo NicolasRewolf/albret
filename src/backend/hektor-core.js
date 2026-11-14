@@ -8,15 +8,11 @@ import yauzl2 from "yauzl";
 import { media as media2 } from "@wix/sdk";
 import { Socket as Socket2 } from "net";
 import { Writable as Writable2 } from "stream";
-import { createHash as createHash5 } from "crypto";
-import https2 from "https";
-import { lookup } from "dns/promises";
+import { createHash as createHash4 } from "crypto";
 
 // velo/backend/hektor-config.js
 var HEKTOR = Object.freeze({
   enabled: true,
-  sourceMode: "sftp",
-  // 'bridge' must be selected explicitly for the legacy HTTPS adapter.
   mediaPreparationEnabled: true,
   // Separate Admin staging; never publishes Location.
   scope: "agence-albret",
@@ -62,10 +58,11 @@ var HEKTOR = Object.freeze({
   }),
   media: Object.freeze({
     folder: "/hektor/agence-albret",
+    // Largest file Wix may hand back for one photo (its own size, checked READY).
     maxImageBytes: 8 * 1024 * 1024,
-    maxTotalImageBytes: 32 * 1024 * 1024,
     maxPhotoReferences: 1e3,
-    // Wix imports by URL without downloading bytes in Velo. 40 new photos per
+    // Wix imports each photo from its URL (LBI sends photos as URLs in the XML;
+    // a modified photo gets a new URL, so the URL is the version). 40 new photos per
     // run within an 8 s budget (file read included): ~45 listings × ~11 photos
     // ≈ 13 runs for the very first import, then only the changed photos.
     // Sized for the 60 write requests a minute of the free plan, worst case:
@@ -76,26 +73,16 @@ var HEKTOR = Object.freeze({
     maxOperationsPerRun: 40,
     maxRunMs: 25e3,
     remote: Object.freeze({
-      enabled: true,
-      // LBI: photos are sent as URLs in the XML.
-      importMode: "wix-url",
-      // LBI: a modified photo gets a new URL, so the URL is the version.
-      versionPolicy: "source-url",
       // A photo Wix definitively refuses is left out of its gallery; uncertain
       // outcomes still block until recovered (never a duplicate import).
       failedPhotos: "omit",
-      manifest: null,
-      // Recipe-only alternative: observed, expiring byte versions.
-      // Host of the agency's photos on the current LBI site. Confirm on the
-      // first real file: inspectHektorExport lists the hosts actually used.
+      // Host of the agency's photos on the LBI site: every photo of the real
+      // files of 13 November 2026 is there (inspectHektorExport lists the hosts).
       allowedHosts: Object.freeze(["agencealbret.staticlbi.com"]),
       // New photos are imported in chunks: two grouped CMS writes per chunk,
       // whatever its size.
       batchSize: 20,
-      concurrency: 5,
-      maxRequests: 100,
-      maxDownloadedBytes: 32 * 1024 * 1024,
-      timeoutMs: 8e3
+      concurrency: 5
     })
   }),
   // Wix site notifications sent by the scheduled import when it fails, is
@@ -107,12 +94,8 @@ var HEKTOR = Object.freeze({
     recipientsRole: "Owner",
     actionUrl: "https://manage.wix.com/dashboard/c49e2d70-3b2c-4dc7-9dc5-eeb606dfc9b5/wix-cms/"
   }),
-  bridgeUrlSecret: "HEKTOR_BRIDGE_URL",
-  // complete HTTPS /v1/snapshot URL
-  bridgeTokenSecret: "HEKTOR_BRIDGE_TOKEN",
   maxAgeMs: 36 * 60 * 60 * 1e3,
   maxItems: 250,
-  maxResponseBytes: 2 * 1024 * 1024,
   maxWrites: 80,
   maxRemovals: 10,
   maxRemovalRatio: 0.4,
@@ -120,8 +103,7 @@ var HEKTOR = Object.freeze({
 });
 
 // velo/backend/hektor-ingest.js
-import { createHash as createHash3 } from "crypto";
-import { isIP as isIP2 } from "net";
+import { isIP } from "net";
 
 // velo/backend/lib/property-details.js
 var PROPERTY_AREA_FIELDS = [
@@ -731,9 +713,14 @@ function publicDetails(value) {
   for (const key of ["view", "sharedWalls"]) {
     if (value[key] !== void 0) result[key] = text(value[key], 80);
   }
-  if (value.garden !== void 0) {
-    if (typeof value.garden !== "boolean") fail("INVALID_PUBLIC_DETAILS");
-    result.garden = value.garden;
+  for (const key of ["chargeComment", "riskStatementComment"]) {
+    if (value[key] !== void 0) result[key] = text(value[key], 1e3);
+  }
+  for (const key of ["garden", "riskStatement"]) {
+    if (value[key] !== void 0) {
+      if (typeof value[key] !== "boolean") fail("INVALID_PUBLIC_DETAILS");
+      result[key] = value[key];
+    }
   }
   for (const [key, valid] of [["kitchenLabel", isKitchenLabel], ["heatingLabel", isHeatingLabel]]) {
     if (value[key] !== void 0) {
@@ -760,7 +747,7 @@ function publicDetails(value) {
     if (value[key] !== void 0) result[key] = text(value[key], 4e3);
   }
   if (value.neighborhood !== void 0) result.neighborhood = text(value.neighborhood, 64);
-  for (const key of ["dpeDate", "energyCostReferenceDate", "availableFrom"]) {
+  for (const key of ["dpeDate", "energyCostReferenceDate", "availableFrom", "riskStatementDate"]) {
     if (value[key] !== void 0) {
       const date = value[key];
       if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) fail("INVALID_DATE");
@@ -1254,6 +1241,184 @@ var childOf = (node, name) => node.children.find((child) => child.name === name)
 var childrenOf = (node, name) => node.children.filter((child) => child.name === name);
 var textOf = (node, name) => (childOf(node, name)?.text ?? "").trim();
 
+// velo/backend/lib/listing-fields.js
+var FICHE_FIELDS = Object.freeze([
+  ["ficheFamille", "Fiche · Famille"],
+  ["ficheLoyer", "Fiche · Loyer"],
+  ["ficheCharges", "Fiche · Charges"],
+  ["ficheDepot", "Fiche · Dépôt de garantie"],
+  ["ficheHonorairesLocataire", "Fiche · Honoraires locataire"],
+  ["ficheEncadrement", "Fiche · Encadrement des loyers"],
+  ["ficheConditions", "Fiche · Conditions de location"],
+  ["ficheClasseEnergie", "Fiche · Classe énergie"],
+  ["ficheConsommation", "Fiche · Consommation DPE"],
+  ["ficheClasseGes", "Fiche · Classe GES"],
+  ["ficheEmissions", "Fiche · Émissions GES"],
+  ["ficheDepenseEnergie", "Fiche · Dépense énergie"],
+  ["ficheCopropriete", "Fiche · Copropriété"],
+  ["ficheHonorairesVente", "Fiche · Honoraires de vente"],
+  ["ficheTaxeFonciere", "Fiche · Taxe foncière"],
+  ["ficheMentions", "Fiche · Mentions"]
+].map(([key, label]) => Object.freeze({ key, label })));
+var finite = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+var amount = (value) => `${value.toLocaleString("fr-FR", {
+  minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  maximumFractionDigits: 2
+})} €`;
+var quantity = (value) => value.toLocaleString("fr-FR", { maximumFractionDigits: 2 });
+var lines = (parts) => parts.filter(Boolean).join("\n");
+var lowerFirst = (text3) => text3.charAt(0).toLowerCase() + text3.slice(1);
+var MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+var frenchDate = (iso2) => {
+  const [year, month, day] = iso2.split("-").map(Number);
+  return `${day === 1 ? "1er" : day} ${MONTHS[month - 1]} ${year}`;
+};
+var yesNo = (value) => value ? "oui" : "non";
+var GEORISQUES_MENTION = "Les informations sur les risques auxquels ce bien est exposé sont disponibles sur le site Géorisques : www.georisques.gouv.fr.";
+function family(item, details) {
+  if (details.commercialStatus === "sold") return "vendu";
+  if (item.transaction === "sale") return "vente";
+  if (["maison", "appartement"].includes(item.propertyType)) return "logement";
+  const labels = `${item.propertyTypeLabel || ""} ${details.propertySubtype || ""}`.toLowerCase();
+  if (item.propertyType === "autre" && /\b(?:garage|garages|parking|parkings|box)\b/u.test(labels)) return "stationnement";
+  return "professionnel";
+}
+function rent(item, details) {
+  if (!finite(item.price)) return "";
+  const terms = details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : "";
+  return `${amount(item.price)} / mois${terms}`;
+}
+function charges(details) {
+  const known = finite(details.rentCharges) ? amount(details.rentCharges) : "";
+  if (details.chargeTerms === "monthly_provision_annual_adjustment") {
+    return known ? `Provision de ${known} / mois, régularisation annuelle` : "Provision mensuelle, régularisation annuelle";
+  }
+  if (details.chargeTerms === "monthly_flat") return known ? `Forfait de ${known} / mois` : "Forfait mensuel";
+  if (details.chargeTerms === "annual_reimbursement") {
+    return known ? `${known}, remboursement annuel par le locataire` : "Remboursement annuel par le locataire";
+  }
+  if (known) {
+    return details.rentChargesIncluded === true ? `${known}, comprises dans le loyer` : details.rentChargesIncluded === false ? `${known}, en plus du loyer` : known;
+  }
+  return details.rentChargesIncluded === true ? "Comprises dans le loyer" : "";
+}
+function tenantFees(details) {
+  if (!finite(details.rentalFees)) return "";
+  const inventory = finite(details.inventoryFees) ? `, dont ${amount(details.inventoryFees)} pour l’état des lieux` : "";
+  return `${amount(details.rentalFees)} TTC${inventory}`;
+}
+function rentControl(details) {
+  if (details.rentControlled === false) return "Bien non soumis à l’encadrement des loyers.";
+  if (details.rentControlled !== true) return "";
+  return lines([
+    "Bien soumis à l’encadrement des loyers.",
+    finite(details.baseRent) && `Loyer de base : ${amount(details.baseRent)} / mois.`,
+    finite(details.referenceRent) && `Loyer de référence majoré : ${amount(details.referenceRent)} / mois.`,
+    finite(details.rentSupplement) && `Complément de loyer : ${amount(details.rentSupplement)} / mois.`
+  ]);
+}
+function conditions(item, details) {
+  const rentText = rent(item, details);
+  const chargesText = finite(details.rentCharges) || details.chargeTerms ? charges(details) : "";
+  const fees = tenantFees(details);
+  return lines([
+    rentText && `Loyer : ${rentText}.`,
+    chargesText && `Charges : ${lowerFirst(chargesText)}.`,
+    finite(details.deposit) && `Dépôt de garantie : ${amount(details.deposit)}.`,
+    fees && `Honoraires à la charge du locataire : ${fees}.`
+  ]);
+}
+var CLASS_WORDS = { VI: "Vierge", NS: "Non soumis" };
+var energyClass = (label) => /^[A-G]$/u.test(label || "") ? label : CLASS_WORDS[label] || "";
+var measured = (label, value, unit) => finite(value) && !CLASS_WORDS[label] ? `${quantity(value)} ${unit}` : "";
+function energyCost(details) {
+  const prices = details.energyCostReferenceDate ? `, prix moyens des énergies indexés au ${frenchDate(details.energyCostReferenceDate)}` : "";
+  if (finite(details.energyCostMin) && finite(details.energyCostMax)) {
+    return `${amount(details.energyCostMin)} à ${amount(details.energyCostMax)} / an, abonnement inclus${prices}`;
+  }
+  return finite(details.energyCostAnnual) ? `${amount(details.energyCostAnnual)} / an, abonnement inclus${prices}` : "";
+}
+function coOwnership(details, kind) {
+  if (details.coOwnership !== true) return "";
+  const lots = Number.isSafeInteger(details.coOwnershipLots) && details.coOwnershipLots > 0 ? `Copropriété de ${quantity(details.coOwnershipLots)} lot${details.coOwnershipLots > 1 ? "s" : ""}` : "Bien en copropriété";
+  const procedure = details.coOwnershipProcedure === true ? ", avec une procédure en cours" : details.coOwnershipProcedure === false ? ", sans procédure en cours" : "";
+  return lines([
+    `${lots}${procedure}.`,
+    kind === "vente" && finite(details.coOwnershipAnnualCharges) && `Quote-part annuelle du budget prévisionnel : ${amount(details.coOwnershipAnnualCharges)}.`
+  ]);
+}
+var LEASE_FACTS = [
+  ["rentExcludingTax", "Loyer hors taxes"],
+  ["priceExcludingTax", "Prix hors taxes"],
+  ["annualRent", "Loyer annuel global"],
+  ["annualCharges", "Charges annuelles globales"],
+  ["annualRentPerSquareMeter", "Loyer annuel au m²"],
+  ["annualChargesPerSquareMeter", "Charges annuelles au m²"],
+  ["monthlyChargesExcludingTax", "Charges mensuelles hors taxes"],
+  ["annualRentChargesIncluded", "Loyer annuel charges comprises"],
+  ["annualRentExcludingTax", "Loyer annuel hors taxes"],
+  ["annualChargesExcludingTax", "Charges annuelles hors taxes"],
+  ["annualRentPerSquareMeterChargesIncluded", "Loyer annuel au m² charges comprises"],
+  ["annualRentPerSquareMeterExcludingTax", "Loyer annuel au m² hors taxes"],
+  ["annualChargesPerSquareMeterExcludingTax", "Charges annuelles au m² hors taxes"]
+];
+function riskStatement(details) {
+  const { riskStatement: concerned, riskStatementDate: date, riskStatementComment: comment } = details;
+  if (concerned === void 0 && !date && !comment) return "";
+  const subject = concerned === true ? "Bien concerné par un état des risques et pollutions" : concerned === false ? "Bien non concerné par un état des risques et pollutions" : "État des risques et pollutions";
+  return `${subject}${date ? `, établi le ${frenchDate(date)}` : ""}${comment ? ` (${comment})` : ""}.`;
+}
+function mentions(item, details) {
+  const fact = (value) => typeof value === "boolean" ? yesNo(value) : finite(value) ? amount(value) : "";
+  const finalConsumption = measured(item.energyLabel, details.energyFinalConsumption, "kWh/m²/an");
+  return lines([
+    ...LEASE_FACTS.map(([key, label]) => fact(details[key]) && `${label} : ${fact(details[key])}.`),
+    details.chargeComment && `Précisions sur les charges : ${details.chargeComment}.`,
+    details.financialConditions && `Conditions financières : ${details.financialConditions}.`,
+    details.coOwnershipProcedureDetails && `Procédure de copropriété : ${details.coOwnershipProcedureDetails}.`,
+    details.dpeDate && `Diagnostic de performance énergétique réalisé le ${frenchDate(details.dpeDate)}.`,
+    finalConsumption && `Consommation d’énergie finale : ${finalConsumption}.`,
+    riskStatement(details),
+    details.riskStatement === true && GEORISQUES_MENTION
+  ]);
+}
+var PAYERS = { buyer: "de l’acquéreur", seller: "du vendeur", both: "de l’acquéreur et du vendeur" };
+function saleFees(details) {
+  const payer = PAYERS[details.feesPayer];
+  if (!payer) return "";
+  const percent = finite(details.feesBuyerPercent) && details.feesPayer !== "seller" ? `${quantity(details.feesBuyerPercent)} % TTC du prix hors honoraires` : "";
+  return lines([
+    `Honoraires à la charge ${payer}${percent && details.feesPayer === "buyer" ? ` : ${percent}` : ""}.`,
+    percent && details.feesPayer === "both" && `Part de l’acquéreur : ${percent}.`,
+    finite(details.priceExcludingBuyerFees) && `Prix hors honoraires : ${amount(details.priceExcludingBuyerFees)}.`
+  ]);
+}
+function ficheFields(item) {
+  const details = item.publicDetails || {};
+  const kind = family(item, details);
+  const rental = item.transaction === "rent";
+  const premises = ["stationnement", "professionnel"].includes(kind);
+  return {
+    ficheFamille: kind,
+    ficheLoyer: rental ? rent(item, details) : "",
+    ficheCharges: rental ? charges(details) : "",
+    ficheDepot: rental && finite(details.deposit) ? amount(details.deposit) : "",
+    ficheHonorairesLocataire: rental ? tenantFees(details) : "",
+    ficheEncadrement: kind === "logement" ? rentControl(details) : "",
+    ficheConditions: rental && premises ? conditions(item, details) : "",
+    ficheClasseEnergie: energyClass(item.energyLabel),
+    ficheConsommation: measured(item.energyLabel, details.energyConsumption, "kWhEP/m²/an"),
+    ficheClasseGes: energyClass(item.gesLabel),
+    ficheEmissions: measured(item.gesLabel, details.gesEmission, "kg éqCO₂/m²/an"),
+    ficheDepenseEnergie: energyCost(details),
+    ficheCopropriete: coOwnership(details, kind),
+    ficheHonorairesVente: kind === "vente" ? saleFees(details) : "",
+    ficheTaxeFonciere: kind === "vente" && finite(details.propertyTax) ? `${amount(details.propertyTax)} / an` : "",
+    // The mentions of an offer no longer apply to a sold listing.
+    ficheMentions: kind === "vendu" ? "" : mentions(item, details)
+  };
+}
+
 // velo/backend/lib/hektor-xml.js
 function failAt(code, field) {
   const error = new BridgeError(code);
@@ -1277,10 +1442,9 @@ var TYPE_CODES = new Map([
   ...[22, 231, 232, 235, 2313, 2314, 2316, 2317].map((code) => [code, "local"])
 ]);
 var plainLabel = (value) => value.normalize("NFD").replace(/[\u0300-\u036f]/gu, "").toLowerCase();
-var GEORISQUES_MENTION = "Les informations sur les risques auxquels ce bien est exposé sont disponibles sur le site Géorisques : www.georisques.gouv.fr.";
 var AVAILABLE_STATUS = 2;
 var SOLD_STATUS = 5;
-var READER_VERSION = "2026-11-14.1";
+var READER_VERSION = "2026-11-14.2";
 var FEES_PAYERS = { 1: "buyer", 2: "seller", 3: "both" };
 var CHARGE_TERMS = { 1: "monthly_flat", 2: "monthly_provision_annual_adjustment", 3: "annual_reimbursement" };
 var FEE_LABELS = { buyer: "acquéreur", seller: "vendeur", both: "acquéreur et vendeur" };
@@ -1406,7 +1570,7 @@ function isoDate(raw, name) {
   if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== iso2) failAt("HEKTOR_XML_INVALID_DATE", name);
   return iso2;
 }
-function energyClass(ad, name) {
+function energyClass2(ad, name) {
   const raw = textOf(ad, name).toUpperCase();
   if (!raw) return void 0;
   if (!/^[A-G]$/u.test(raw)) failAt("HEKTOR_XML_INVALID_ENERGY_CLASS", name);
@@ -1423,7 +1587,7 @@ function photoUrl(raw) {
   return raw;
 }
 var money = (value) => `${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(value)} €`;
-var yesNo = (value) => value ? "oui" : "non";
+var yesNo2 = (value) => value ? "oui" : "non";
 var classLabel = (value) => ({ VI: "vierge", NS: "non soumis" })[value] || value;
 function safeFlag(ad, name) {
   const raw = textOf(ad, name).toUpperCase();
@@ -1448,10 +1612,10 @@ function optionalWebUrl(raw, max = 256) {
     return void 0;
   }
 }
-function disclosure(details, energyLabel, gesLabel, extraLines = []) {
-  const lines = [];
+function disclosure(details, energyLabel, gesLabel) {
+  const lines2 = [];
   const add = (key, label, formatter = String) => {
-    if (details[key] !== void 0) lines.push(`${label} : ${formatter(details[key])}.`);
+    if (details[key] !== void 0) lines2.push(`${label} : ${formatter(details[key])}.`);
   };
   add("feesPayer", "Honoraires à la charge de", (value) => FEE_LABELS[value]);
   add("feesBuyerPercent", "Honoraires TTC acquéreur, en pourcentage du prix hors honoraires", (value) => `${value} %`);
@@ -1460,34 +1624,34 @@ function disclosure(details, energyLabel, gesLabel, extraLines = []) {
   add("inventoryFees", "Dont honoraires TTC pour l’état des lieux", money);
   add("rentCharges", "Montant des charges locataire transmis", money);
   add("chargeTerms", "Modalités des charges locataire", (value) => CHARGE_LABELS[value]);
-  add("rentChargesIncluded", "Loyer charges comprises", yesNo);
-  add("rentExcludingTax", "Loyer hors taxes", yesNo);
+  add("rentChargesIncluded", "Loyer charges comprises", yesNo2);
+  add("rentExcludingTax", "Loyer hors taxes", yesNo2);
   add("baseRent", "Loyer de base hors charges", money);
   add("referenceRent", "Loyer de référence majoré", money);
   add("rentSupplement", "Complément de loyer", money);
-  add("rentControlled", "Soumis à l’encadrement des loyers", yesNo);
+  add("rentControlled", "Soumis à l’encadrement des loyers", yesNo2);
   add("deposit", "Dépôt de garantie", money);
-  add("furnished", "Meublé", yesNo);
-  add("priceExcludingTax", "Prix hors taxes", yesNo);
+  add("furnished", "Meublé", yesNo2);
+  add("priceExcludingTax", "Prix hors taxes", yesNo2);
   add("annualRent", "Loyer annuel global", money);
   add("annualCharges", "Charges annuelles globales", money);
   add("annualRentPerSquareMeter", "Loyer annuel au m²", money);
   add("annualChargesPerSquareMeter", "Charges annuelles au m²", money);
-  add("monthlyChargesExcludingTax", "Charges mensuelles hors taxes", yesNo);
-  add("annualRentChargesIncluded", "Loyer annuel charges comprises", yesNo);
-  add("annualRentExcludingTax", "Loyer annuel hors taxes", yesNo);
-  add("annualChargesExcludingTax", "Charges annuelles hors taxes", yesNo);
-  add("annualRentPerSquareMeterChargesIncluded", "Loyer annuel au m² charges comprises", yesNo);
-  add("annualRentPerSquareMeterExcludingTax", "Loyer annuel au m² hors taxes", yesNo);
-  add("annualChargesPerSquareMeterExcludingTax", "Charges annuelles au m² hors taxes", yesNo);
+  add("monthlyChargesExcludingTax", "Charges mensuelles hors taxes", yesNo2);
+  add("annualRentChargesIncluded", "Loyer annuel charges comprises", yesNo2);
+  add("annualRentExcludingTax", "Loyer annuel hors taxes", yesNo2);
+  add("annualChargesExcludingTax", "Charges annuelles hors taxes", yesNo2);
+  add("annualRentPerSquareMeterChargesIncluded", "Loyer annuel au m² charges comprises", yesNo2);
+  add("annualRentPerSquareMeterExcludingTax", "Loyer annuel au m² hors taxes", yesNo2);
+  add("annualChargesPerSquareMeterExcludingTax", "Charges annuelles au m² hors taxes", yesNo2);
   add("feeScheduleUrl", "Barème des honoraires");
-  add("coOwnership", "Bien en copropriété", yesNo);
+  add("coOwnership", "Bien en copropriété", yesNo2);
   add("coOwnershipLots", "Nombre de lots de copropriété");
   add("coOwnershipAnnualCharges", "Quote-part annuelle du budget prévisionnel de copropriété", money);
-  add("coOwnershipProcedure", "Syndicat des copropriétaires en procédure", yesNo);
+  add("coOwnershipProcedure", "Syndicat des copropriétaires en procédure", yesNo2);
   add("coOwnershipProcedureDetails", "Détails de la procédure");
-  if (energyLabel) lines.push(`Classe énergie : ${classLabel(energyLabel)}.`);
-  if (gesLabel) lines.push(`Classe GES : ${classLabel(gesLabel)}.`);
+  if (energyLabel) lines2.push(`Classe énergie : ${classLabel(energyLabel)}.`);
+  if (gesLabel) lines2.push(`Classe GES : ${classLabel(gesLabel)}.`);
   add("energyConsumption", "Consommation d’énergie primaire", (value) => `${value} kWhEP/m²/an`);
   add("gesEmission", "Émissions de gaz à effet de serre", (value) => `${value} kg éqCO2/m²/an`);
   add("dpeDate", "Date de réalisation du DPE");
@@ -1498,8 +1662,17 @@ function disclosure(details, energyLabel, gesLabel, extraLines = []) {
   add("energyCostAnnual", "Estimation annuelle des dépenses énergétiques, abonnement inclus", money);
   add("energyFinalConsumption", "Consommation d’énergie finale", (value) => `${value} kWh/m²/an`);
   add("financialConditions", "Conditions financières");
-  for (const line of extraLines) if (line) lines.push(line);
-  return lines.join("\n");
+  add("chargeComment", "Précisions sur les charges");
+  const { riskStatement: concerned, riskStatementDate: date, riskStatementComment: comment } = details;
+  if (concerned !== void 0 || date || comment) {
+    lines2.push(`${[
+      concerned !== void 0 ? `Bien concerné par un état des risques et pollutions (ERP) : ${yesNo2(concerned)}` : "État des risques et pollutions (ERP)",
+      date ? `établi le ${date.split("-").reverse().join("/")}` : "",
+      comment ? `(${comment})` : ""
+    ].filter(Boolean).join(" ")}.`);
+  }
+  if (concerned === true) lines2.push(GEORISQUES_MENTION);
+  return lines2.join("\n");
 }
 function identity(ad, options) {
   const idNode = childOf(ad, "id");
@@ -1530,8 +1703,8 @@ function mapAd(ad, who, sold = false) {
   if (priceNode?.attributes.currency && priceNode.attributes.currency !== "EUR") fail2("HEKTOR_XML_UNSUPPORTED_CURRENCY");
   if (!sold && flag(ad, "nous_consulter") === true) fail2("HEKTOR_XML_UNSUPPORTED_HIDDEN_PRICE");
   const price = sold ? void 0 : number2(ad, "prix", { required: true, zeroIsAbsent: true });
-  const energyLabel = flag(ad, "dpe_non_concerne") === true ? "NS" : flag(ad, "dpe_vierge") === true ? "VI" : energyClass(ad, "class_energie");
-  const gesLabel = ["NS", "VI"].includes(energyLabel) ? energyLabel : energyClass(ad, "class_emission_gaz");
+  const energyLabel = flag(ad, "dpe_non_concerne") === true ? "NS" : flag(ad, "dpe_vierge") === true ? "VI" : energyClass2(ad, "class_energie");
+  const gesLabel = ["NS", "VI"].includes(energyLabel) ? energyLabel : energyClass2(ad, "class_emission_gaz");
   const details = {};
   const put = (key, value) => {
     if (value !== void 0) details[key] = value;
@@ -1652,21 +1825,10 @@ function mapAd(ad, who, sold = false) {
   const year = number2(ad, "dpe_annee_ref_estim", { integer: true, max: 9999 });
   if (year >= 2006 && year <= 2100 && details.energyCostMin !== void 0) put("energyCostReferenceDate", `${year}-01-01`);
   put("energyFinalConsumption", number2(ad, "valeurEnergieFinale", { integer: true, max: 1e7, zeroIsAbsent: true }));
-  const extraDisclosures = [];
-  const chargeComment = publicText(textOf(ad, "chargesCommentaires"), 1e3, { singleLine: true, name: "chargesCommentaires" });
-  if (chargeComment) extraDisclosures.push(`Précisions sur les charges : ${chargeComment}.`);
-  const erpFlag = safeFlag(ad, "risques_polution");
-  const erpIso = isoDate(textOf(ad, "erp_date"), "erp_date");
-  const erpDate = erpIso ? erpIso.split("-").reverse().join("/") : "";
-  const erpComment = publicText(textOf(ad, "erp_commentaire"), 1e3, { singleLine: true, name: "erp_commentaire" });
-  if (erpFlag !== void 0 || erpDate || erpComment) {
-    extraDisclosures.push(`${[
-      erpFlag !== void 0 ? `Bien concerné par un état des risques et pollutions (ERP) : ${yesNo(erpFlag)}` : "État des risques et pollutions (ERP)",
-      erpDate ? `établi le ${erpDate}` : "",
-      erpComment ? `(${erpComment})` : ""
-    ].filter(Boolean).join(" ")}.`);
-  }
-  if (erpFlag === true) extraDisclosures.push(GEORISQUES_MENTION);
+  put("chargeComment", publicText(textOf(ad, "chargesCommentaires"), 1e3, { singleLine: true, name: "chargesCommentaires" }) || void 0);
+  put("riskStatement", safeFlag(ad, "risques_polution"));
+  put("riskStatementDate", isoDate(textOf(ad, "erp_date"), "erp_date"));
+  put("riskStatementComment", publicText(textOf(ad, "erp_commentaire"), 1e3, { singleLine: true, name: "erp_commentaire" }) || void 0);
   const virtualTourUrl = optionalWebUrl(textOf(ad, "visite_virtuelle") || textOf(ad, "uRLVisiteVirtuelle"), 256);
   const priceLabel = sold ? "Vendu" : transaction === "sale" ? money(price) : `Loyer : ${money(price)}${details.rentChargesIncluded === true ? " charges comprises" : details.rentChargesIncluded === false ? " hors charges" : ""}`;
   const images = childOf(ad, "images");
@@ -1688,7 +1850,7 @@ function mapAd(ad, who, sold = false) {
     area: number2(ad, "surface_habitable", { required: residential, max: 1e7, zeroIsAbsent: true }),
     rooms: number2(ad, "nb_pieces", { integer: true, max: 1e3, zeroIsAbsent: true }) ?? number2(ad, "nb_piece", { required: residential, integer: true, max: 1e3, zeroIsAbsent: true }),
     photos,
-    legalText: disclosure(details, energyLabel, gesLabel, extraDisclosures),
+    legalText: disclosure(details, energyLabel, gesLabel),
     publicDetails: details
   };
   if (who.reference) item.reference = publicText(who.reference, 20, { singleLine: true });
@@ -1895,13 +2057,11 @@ function createHektorArchiveParser(yauzl3) {
       kind: "hektor-prepared",
       publishable: false,
       metadata: metadata2,
-      photoMode: "URL",
+      // The delivery attaches no image: every photo is a URL that Wix imports.
       listings: items.map(({ photos: unusedPhotos, ...fields }) => ({
         fields,
         photoReferences: referencesById.get(fields.sourceId).map(({ url, alt }) => ({ reference: url, alt }))
       })),
-      // The delivery attaches no image: every photo is a URL to rehost.
-      mediaEntries: /* @__PURE__ */ new Map(),
       held: held.map(({ reference, code, field }) => ({ reference, code, ...field ? { field } : {} })),
       // Delivered listings that are not available (sold, let, closed), by status.
       notPublishedByStatus
@@ -1909,14 +2069,11 @@ function createHektorArchiveParser(yauzl3) {
   };
 }
 function summarizePreparedFeed(draft) {
-  if (!draft || draft.kind !== "hektor-prepared" || draft.publishable !== false || !Array.isArray(draft.listings) || !(draft.mediaEntries instanceof Map)) fail2("HEKTOR_INVALID_DRAFT");
+  if (!draft || draft.kind !== "hektor-prepared" || draft.publishable !== false || !Array.isArray(draft.listings)) fail2("HEKTOR_INVALID_DRAFT");
   return {
     publishable: false,
     listingCount: draft.listings.length,
     photoReferenceCount: draft.listings.reduce((total, item) => total + item.photoReferences.length, 0),
-    attachedImageCount: draft.mediaEntries.size,
-    attachedImageBytes: [...draft.mediaEntries.values()].reduce((total, bytes) => total + bytes.length, 0),
-    photoMode: draft.photoMode,
     ...draft.notPublishedByStatus && Object.keys(draft.notPublishedByStatus).length ? { notPublishedByStatus: { ...draft.notPublishedByStatus } } : {},
     // Dossier numbers, fault codes and XML tag names only, so the agency can
     // fix them in Hektor.
@@ -1927,379 +2084,16 @@ function summarizePreparedFeed(draft) {
   };
 }
 
-// velo/backend/hektor-remote-media.js
-import https from "https";
-import { lookup as dnsLookup } from "dns/promises";
-import { isIP } from "net";
-var MIME_TYPES = /* @__PURE__ */ new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-var DEFAULTS3 = Object.freeze({
-  enabled: false,
-  allowedHosts: [],
-  maxRequests: 100,
-  maxDownloadedBytes: 32 * 1024 * 1024,
-  timeoutMs: 8e3,
-  maxImageBytes: 8 * 1024 * 1024
-});
-var RemoteMediaError = class extends Error {
-  constructor(code) {
-    super(code);
-    this.name = "RemoteMediaError";
-  }
-};
-var fail3 = (code) => {
-  throw new RemoteMediaError(code);
-};
-function isPublicMediaAddress(address) {
-  if (typeof address !== "string") return false;
-  const family = isIP(address);
-  if (family === 4) {
-    const [a2, b2, c] = address.split(".").map(Number);
-    return !(a2 === 0 || a2 === 10 || a2 === 127 || a2 >= 224 || a2 === 100 && b2 >= 64 && b2 <= 127 || a2 === 169 && b2 === 254 || a2 === 172 && b2 >= 16 && b2 <= 31 || a2 === 192 && (b2 === 168 || b2 === 0 || b2 === 88 && c === 99) || a2 === 198 && (b2 === 18 || b2 === 19 || b2 === 51 && c === 100) || a2 === 203 && b2 === 0 && c === 113);
-  }
-  if (family !== 6 || address.includes(".") || address.includes("%")) return false;
-  const halves = address.toLowerCase().split("::");
-  const left = halves[0] ? halves[0].split(":") : [];
-  const right = halves[1] ? halves[1].split(":") : [];
-  const groups = halves.length === 2 ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right] : left;
-  const [a, b] = groups.map((value) => parseInt(value, 16));
-  return (a & 57344) === 8192 && a !== 8194 && !(a === 8193 && (b < 512 || b === 3512)) && !(a === 16383 && b < 4096);
-}
-function settings(input) {
-  const config = { ...DEFAULTS3, ...input };
-  if (typeof config.enabled !== "boolean" || !Array.isArray(config.allowedHosts) || config.allowedHosts.length > 100) fail3("MEDIA_REMOTE_CONFIG_INVALID");
-  const hosts = new Set(config.allowedHosts.map((host) => {
-    if (typeof host !== "string" || host.length > 253 || isIP(host) || !/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/.test(host) || host.split(".").some((label) => label.length > 63)) fail3("MEDIA_REMOTE_CONFIG_INVALID");
-    return host.toLowerCase();
-  }));
-  for (const [key, min, max] of [
-    ["maxRequests", 1, 1e3],
-    ["maxImageBytes", 12, 32 * 1024 * 1024],
-    ["maxDownloadedBytes", 12, 128 * 1024 * 1024],
-    ["timeoutMs", 1, 6e4]
-  ]) {
-    if (!Number.isSafeInteger(config[key]) || config[key] < min || config[key] > max) fail3("MEDIA_REMOTE_CONFIG_INVALID");
-  }
-  return { ...config, hosts };
-}
-function remoteMediaReadiness(input) {
-  const enabled = input?.enabled === true;
-  try {
-    const config = settings(input);
-    return {
-      enabled,
-      configurationReady: enabled && config.hosts.size > 0,
-      allowedHostCount: config.hosts.size,
-      networkVerified: false,
-      missing: [
-        ...!enabled ? ["MEDIA_REMOTE_DISABLED"] : [],
-        ...!config.hosts.size ? ["MEDIA_REMOTE_HOSTS_REQUIRED"] : []
-      ]
-    };
-  } catch {
-    return {
-      enabled,
-      configurationReady: false,
-      allowedHostCount: 0,
-      networkVerified: false,
-      missing: ["MEDIA_REMOTE_CONFIG_INVALID"]
-    };
-  }
-}
-function allowedUrl(reference, hosts) {
-  if (typeof reference !== "string" || !reference || reference.length > 2048 || reference !== reference.trim() || /[\x00-\x20\x7f\\]/.test(reference)) fail3("MEDIA_URL_INVALID");
-  let url;
-  try {
-    url = new URL(reference);
-  } catch {
-    fail3("MEDIA_URL_INVALID");
-  }
-  if (url.protocol !== "https:" || url.username || url.password || url.hash || url.port || url.hostname.endsWith(".") || !hosts.has(url.hostname.toLowerCase())) fail3("MEDIA_URL_NOT_ALLOWED");
-  return url;
-}
-async function readHektorRemotePhotos(references, input, {
-  lookup: lookup2 = dnsLookup,
-  get = (url, options, callback) => https.get(url, options, callback),
-  now = Date.now
-} = {}) {
-  const config = settings(input);
-  if (!config.enabled) fail3("MEDIA_REMOTE_DISABLED");
-  if (!config.hosts.size) fail3("MEDIA_REMOTE_HOSTS_REQUIRED");
-  if (!Array.isArray(references) || references.length > 1e3 || typeof lookup2 !== "function" || typeof get !== "function" || typeof now !== "function") fail3("MEDIA_PHOTOS_INVALID");
-  const byReference = /* @__PURE__ */ new Map();
-  const unique = /* @__PURE__ */ new Map();
-  for (const reference of references) {
-    const url = allowedUrl(reference, config.hosts);
-    byReference.set(reference, url.href);
-    unique.set(url.href, url);
-  }
-  if (unique.size > config.maxRequests) fail3("MEDIA_REQUEST_LIMIT_EXCEEDED");
-  const stats = { requestCount: 0, downloadedBytes: 0, uniqueUrlCount: unique.size };
-  const downloaded = /* @__PURE__ */ new Map();
-  if (!unique.size) return { photos: /* @__PURE__ */ new Map(), stats };
-  const started = now();
-  let stopped = false, failure, cancelCurrent, rejectDeadline;
-  const expired = new Promise((_, reject) => {
-    rejectDeadline = reject;
-  });
-  const expire = () => {
-    if (stopped) return;
-    failure = new RemoteMediaError("MEDIA_TIMEOUT");
-    stopped = true;
-    cancelCurrent?.(failure);
-    rejectDeadline(failure);
-  };
-  const timer = setTimeout(expire, config.timeoutMs);
-  const active = () => {
-    if (!stopped && now() - started >= config.timeoutMs) expire();
-    if (stopped) throw failure || new RemoteMediaError("MEDIA_FETCH_FAILED");
-  };
-  function request(url, record) {
-    return new Promise((resolve, reject) => {
-      let req, response, settled = false, terminalError;
-      const finish = (error, value) => {
-        if (settled) return;
-        settled = true;
-        terminalError = error;
-        if (cancelCurrent === cancel) cancelCurrent = void 0;
-        if (error) {
-          response?.destroy();
-          req?.destroy();
-          reject(error);
-        } else resolve(value);
-      };
-      const cancel = (error) => finish(error);
-      cancelCurrent = cancel;
-      try {
-        active();
-        stats.requestCount++;
-        if (stats.requestCount > config.maxRequests) fail3("MEDIA_REQUEST_LIMIT_EXCEEDED");
-        req = get(url, {
-          agent: false,
-          family: record.family,
-          rejectUnauthorized: true,
-          // Original hostname remains in URL: Host and TLS verify that name.
-          // Only the already-validated address can be used for the socket.
-          lookup(_hostname, options, callback) {
-            if (options?.all) callback(null, [record]);
-            else callback(null, record.address, record.family);
-          },
-          headers: { Accept: [...MIME_TYPES].join(", "), "Accept-Encoding": "identity" },
-          maxHeaderSize: 8192
-        }, (incoming) => {
-          response = incoming;
-          if (settled || stopped) {
-            incoming.destroy();
-            return;
-          }
-          try {
-            active();
-            if (incoming.statusCode !== 200) fail3(incoming.statusCode >= 300 && incoming.statusCode < 400 ? "MEDIA_REDIRECT_REJECTED" : "MEDIA_FETCH_FAILED");
-            const declared = incoming.headers["content-length"];
-            if (declared !== void 0 && (typeof declared !== "string" || !/^\d+$/.test(declared) || !Number.isSafeInteger(Number(declared)) || Number(declared) > config.maxImageBytes)) fail3("MEDIA_TOO_LARGE");
-            if (declared !== void 0 && Number(declared) > config.maxDownloadedBytes - stats.downloadedBytes) fail3("MEDIA_DOWNLOAD_BUDGET_EXCEEDED");
-            if (incoming.headers["content-encoding"] && incoming.headers["content-encoding"] !== "identity") fail3("MEDIA_ENCODING_UNSUPPORTED");
-            const suppliedType = incoming.headers["content-type"];
-            const contentType = typeof suppliedType === "string" ? suppliedType.split(";")[0].trim().toLowerCase() : "";
-            if (!MIME_TYPES.has(contentType)) fail3("MEDIA_CONTENT_TYPE_UNSUPPORTED");
-            const chunks = [];
-            let size = 0;
-            incoming.on("data", (chunk) => {
-              if (settled || stopped) return;
-              try {
-                active();
-                if (!Buffer.isBuffer(chunk)) fail3("MEDIA_FETCH_FAILED");
-                size += chunk.length;
-                stats.downloadedBytes += chunk.length;
-                if (size > config.maxImageBytes) fail3("MEDIA_TOO_LARGE");
-                if (stats.downloadedBytes > config.maxDownloadedBytes) fail3("MEDIA_DOWNLOAD_BUDGET_EXCEEDED");
-                chunks.push(chunk);
-              } catch (error) {
-                finish(error);
-              }
-            });
-            incoming.on("end", () => {
-              if (settled || stopped) return;
-              try {
-                active();
-                if (declared !== void 0 && size !== Number(declared)) fail3("MEDIA_FETCH_FAILED");
-                if (incoming.complete === false) fail3("MEDIA_FETCH_FAILED");
-                finish(null, { bytes: Buffer.concat(chunks, size), contentType });
-              } catch (error) {
-                finish(error);
-              }
-            });
-            incoming.on("error", () => finish(new RemoteMediaError("MEDIA_FETCH_FAILED")));
-            incoming.on("aborted", () => finish(new RemoteMediaError("MEDIA_FETCH_FAILED")));
-          } catch (error) {
-            finish(error);
-          }
-        });
-        req.on("error", () => finish(new RemoteMediaError("MEDIA_FETCH_FAILED")));
-        if (settled && terminalError) req.destroy();
-      } catch (error) {
-        finish(error instanceof RemoteMediaError ? error : new RemoteMediaError("MEDIA_FETCH_FAILED"));
-      }
-    });
-  }
-  async function run() {
-    for (const [key, url] of unique) {
-      active();
-      let records;
-      try {
-        records = await lookup2(url.hostname, { all: true, verbatim: true });
-      } catch {
-        active();
-        fail3("MEDIA_DNS_FAILED");
-      }
-      active();
-      if (!Array.isArray(records) || !records.length || records.some((record) => !record || !isPublicMediaAddress(record.address) || isIP(record.address) !== record.family)) fail3("MEDIA_PRIVATE_DESTINATION");
-      downloaded.set(key, await request(url, { address: records[0].address, family: records[0].family }));
-      active();
-    }
-    return { photos: new Map([...byReference].map(([reference, key]) => [reference, downloaded.get(key)])), stats };
-  }
-  try {
-    return await Promise.race([run(), expired]);
-  } catch (error) {
-    if (error instanceof RemoteMediaError) throw error;
-    fail3("MEDIA_FETCH_FAILED");
-  } finally {
-    clearTimeout(timer);
-    stopped = true;
-    cancelCurrent?.(failure || new RemoteMediaError("MEDIA_FETCH_FAILED"));
-  }
-}
-
 // velo/backend/hektor-ingest.js
-var fail4 = (code) => {
+var fail3 = (code) => {
   throw new Error(code);
 };
-var TYPES = { jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" };
-var MIME_TYPES2 = new Set(Object.values(TYPES));
 var object2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-var SOURCE_URL_POLICY = "source-url";
 var SOURCE_URL_VERSION = "source-url-v1";
-function dimensions(width, height) {
-  if (!width || !height || width > 5e4 || height > 5e4 || width * height > 1e8) fail4("MEDIA_INVALID_IMAGE");
-}
-function inspectRaster(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 12) fail4("MEDIA_INVALID_IMAGE");
-  if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
-    let offset = 8;
-    let data = false;
-    while (offset + 12 <= bytes.length) {
-      const length = bytes.readUInt32BE(offset);
-      const end = offset + length + 12;
-      if (end > bytes.length) fail4("MEDIA_INVALID_IMAGE");
-      const type = bytes.toString("ascii", offset + 4, offset + 8);
-      if (offset === 8) {
-        if (type !== "IHDR" || length !== 13) fail4("MEDIA_INVALID_IMAGE");
-        dimensions(bytes.readUInt32BE(offset + 8), bytes.readUInt32BE(offset + 12));
-      } else if (type === "IHDR") fail4("MEDIA_INVALID_IMAGE");
-      if (type === "IDAT" && length > 0) data = true;
-      if (type === "IEND") {
-        if (length !== 0 || end !== bytes.length || !data) fail4("MEDIA_INVALID_IMAGE");
-        return { extension: "png", contentType: TYPES.png };
-      }
-      offset = end;
-    }
-    fail4("MEDIA_INVALID_IMAGE");
-  }
-  if (bytes[0] === 255 && bytes[1] === 216) {
-    if (bytes.at(-2) !== 255 || bytes.at(-1) !== 217) fail4("MEDIA_INVALID_IMAGE");
-    let offset = 2;
-    let frame = false;
-    while (offset + 4 <= bytes.length) {
-      if (bytes[offset++] !== 255) fail4("MEDIA_INVALID_IMAGE");
-      while (bytes[offset] === 255) offset++;
-      const marker = bytes[offset++];
-      if ([0, 216, 217].includes(marker) || marker === void 0) fail4("MEDIA_INVALID_IMAGE");
-      if (marker === 1 || marker >= 208 && marker <= 215) continue;
-      if (offset + 2 > bytes.length) fail4("MEDIA_INVALID_IMAGE");
-      const size = bytes.readUInt16BE(offset);
-      if (size < 2 || offset + size > bytes.length - 2) fail4("MEDIA_INVALID_IMAGE");
-      if (marker >= 192 && marker <= 207 && ![196, 200, 204].includes(marker)) {
-        if (size < 8) fail4("MEDIA_INVALID_IMAGE");
-        dimensions(bytes.readUInt16BE(offset + 5), bytes.readUInt16BE(offset + 3));
-        frame = true;
-      }
-      if (marker === 218) {
-        if (!frame || size < 6 || offset + size >= bytes.length - 2) fail4("MEDIA_INVALID_IMAGE");
-        return { extension: "jpg", contentType: TYPES.jpg };
-      }
-      offset += size;
-    }
-    fail4("MEDIA_INVALID_IMAGE");
-  }
-  const header = bytes.toString("ascii", 0, 6);
-  if (header === "GIF87a" || header === "GIF89a") {
-    if (bytes.length < 14) fail4("MEDIA_INVALID_IMAGE");
-    dimensions(bytes.readUInt16LE(6), bytes.readUInt16LE(8));
-    let offset = 13 + (bytes[10] & 128 ? 3 * 2 ** ((bytes[10] & 7) + 1) : 0);
-    let frames = 0;
-    const subBlocks = () => {
-      let total = 0;
-      while (offset < bytes.length) {
-        const length = bytes[offset++];
-        if (length === 0) return total;
-        total += length;
-        offset += length;
-        if (offset > bytes.length) fail4("MEDIA_INVALID_IMAGE");
-      }
-      fail4("MEDIA_INVALID_IMAGE");
-    };
-    while (offset < bytes.length) {
-      const marker = bytes[offset++];
-      if (marker === 59) {
-        if (!frames || offset !== bytes.length) fail4("MEDIA_INVALID_IMAGE");
-        return { extension: "gif", contentType: TYPES.gif };
-      }
-      if (marker === 33) {
-        offset++;
-        subBlocks();
-        continue;
-      }
-      if (marker !== 44 || offset + 9 > bytes.length) fail4("MEDIA_INVALID_IMAGE");
-      dimensions(bytes.readUInt16LE(offset + 4), bytes.readUInt16LE(offset + 6));
-      const packed = bytes[offset + 8];
-      offset += 9 + (packed & 128 ? 3 * 2 ** ((packed & 7) + 1) : 0);
-      if (offset >= bytes.length || bytes[offset] < 2 || bytes[offset] > 12) fail4("MEDIA_INVALID_IMAGE");
-      offset++;
-      if (!subBlocks()) fail4("MEDIA_INVALID_IMAGE");
-      frames++;
-    }
-    fail4("MEDIA_INVALID_IMAGE");
-  }
-  if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
-    if (bytes.readUInt32LE(4) !== bytes.length - 8) fail4("MEDIA_INVALID_IMAGE");
-    let offset = 12;
-    let frame = false;
-    while (offset + 8 <= bytes.length) {
-      const tag = bytes.toString("ascii", offset, offset + 4);
-      const length = bytes.readUInt32LE(offset + 4);
-      const start = offset + 8;
-      const end = start + length;
-      if (end + length % 2 > bytes.length) fail4("MEDIA_INVALID_IMAGE");
-      if (tag === "VP8 ") {
-        if (length < 10 || !bytes.subarray(start + 3, start + 6).equals(Buffer.from([157, 1, 42]))) fail4("MEDIA_INVALID_IMAGE");
-        dimensions(bytes.readUInt16LE(start + 6) & 16383, bytes.readUInt16LE(start + 8) & 16383);
-        frame = true;
-      } else if (tag === "VP8L") {
-        if (length < 5 || bytes[start] !== 47) fail4("MEDIA_INVALID_IMAGE");
-        const value = bytes.readUInt32LE(start + 1);
-        dimensions((value & 16383) + 1, (value >>> 14 & 16383) + 1);
-        frame = true;
-      } else if (tag === "ANIM" || tag === "ANMF") fail4("MEDIA_FORMAT_UNSUPPORTED");
-      offset = end + length % 2;
-    }
-    if (!frame || offset !== bytes.length) fail4("MEDIA_INVALID_IMAGE");
-    return { extension: "webp", contentType: TYPES.webp };
-  }
-  fail4("MEDIA_FORMAT_UNSUPPORTED");
-}
+var HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+var validHosts = (hosts) => Array.isArray(hosts) && hosts.length > 0 && hosts.length <= 100 && hosts.every((host) => typeof host === "string" && host.length <= 253 && !isIP(host) && HOSTNAME.test(host) && host.split(".").every((label) => label.length <= 63));
 function hektorSftpReadiness(config) {
   const missing = [];
-  if (config?.sourceMode !== "sftp") missing.push("SFTP_MODE_NOT_SELECTED");
   const sftp = config?.sftp || {};
   if (!sftp.host) missing.push("SFTP_HOST_REQUIRED");
   if (!sftp.remoteFile) missing.push("SFTP_PATH_REQUIRED");
@@ -2311,156 +2105,57 @@ function hektorSftpReadiness(config) {
   if (feed.fullExportConfirmed !== true) missing.push("FULL_EXPORT_CONFIRMATION_REQUIRED");
   if (feed.deliveryConfirmed !== true) missing.push("DELIVERY_CONFIRMATION_REQUIRED");
   const remote = config?.media?.remote || {};
-  if (remote.enabled === true && remote.importMode === "wix-url" && remote.manifest == null && remote.versionPolicy !== SOURCE_URL_POLICY) missing.push("MEDIA_VERSION_POLICY_REQUIRED");
+  if (!validHosts(remote.allowedHosts)) missing.push("MEDIA_REMOTE_HOSTS_REQUIRED");
   if (remote.failedPhotos !== void 0 && !["block", "omit"].includes(remote.failedPhotos)) missing.push("MEDIA_FAILED_PHOTO_POLICY_INVALID");
-  for (const key of ["maxImageBytes", "maxTotalImageBytes", "maxPhotoReferences", "maxOperationsPerRun"]) {
+  for (const key of ["maxImageBytes", "maxPhotoReferences", "maxOperationsPerRun"]) {
     if (!Number.isSafeInteger(config?.media?.[key]) || config.media[key] <= 0) missing.push("MEDIA_LIMITS_REQUIRED");
   }
   if (config?.media?.maxOperationsPerRun > 50) missing.push("MEDIA_OPERATION_LIMIT_EXCEEDED");
   return {
-    sourceMode: config?.sourceMode === "sftp" ? "sftp" : "other",
     syncEnabled: config?.enabled === true,
     mediaPreparationEnabled: config?.mediaPreparationEnabled === true,
     configurationReady: missing.length === 0,
     missing: [...new Set(missing)],
-    networkVerified: false,
-    remotePhotos: remoteMediaReadiness({ ...config?.media?.remote, maxImageBytes: config?.media?.maxImageBytes })
+    networkVerified: false
   };
 }
-function directPhotoInputs(draft, limits, archiveBytes, checkedAt) {
-  const remote = limits.remote;
-  const manifest = remote?.manifest;
-  const hosts = new Set(remote.allowedHosts.map((host) => host.toLowerCase()));
+function photoInputs(draft, limits) {
+  const references = draft.listings.flatMap((item) => item.photoReferences.map((photo) => photo.reference));
+  if (references.length > limits.maxPhotoReferences) fail3("MEDIA_REFERENCE_LIMIT_EXCEEDED");
+  const hosts = new Set(limits.remote.allowedHosts.map((host) => host.toLowerCase()));
   const validateReference = (reference) => {
-    if (typeof reference !== "string" || !reference || reference.length > 2048 || reference !== reference.trim() || /[\x00-\x20\x7f\\]/.test(reference)) fail4("MEDIA_URL_INVALID");
+    if (typeof reference !== "string" || !reference || reference.length > 2048 || reference !== reference.trim() || /[\x00-\x20\x7f\\]/.test(reference)) fail3("MEDIA_URL_INVALID");
     let url;
     try {
       url = new URL(reference);
     } catch {
-      fail4("MEDIA_URL_INVALID");
+      fail3("MEDIA_URL_INVALID");
     }
     const host = url.hostname.toLowerCase();
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.port || isIP2(host.replace(/^\[|\]$/g, "")) || host.endsWith(".") || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || !hosts.has(host)) fail4("MEDIA_URL_NOT_ALLOWED");
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.port || isIP(host.replace(/^\[|\]$/g, "")) || host.endsWith(".") || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || !hosts.has(host)) fail3("MEDIA_URL_NOT_ALLOWED");
   };
-  if (manifest == null && remote.versionPolicy === SOURCE_URL_POLICY) {
-    const unique2 = /* @__PURE__ */ new Map();
-    const listings2 = draft.listings.map(({ fields, photoReferences }) => ({
-      fields,
-      photos: photoReferences.map(({ reference, alt }) => {
-        validateReference(reference);
-        const input = { reference, version: SOURCE_URL_VERSION };
-        const key = JSON.stringify([reference, SOURCE_URL_VERSION]);
-        if (!unique2.has(key)) unique2.set(key, input);
-        return { key, alt };
-      })
-    }));
-    if (unique2.size > limits.maxPhotoReferences) fail4("MEDIA_REFERENCE_LIMIT_EXCEEDED");
-    return { listings: listings2, unique: unique2, direct: true, validUntil: Infinity };
-  }
-  const archiveSha256 = createHash3("sha256").update(archiveBytes).digest("hex");
-  if (!object2(manifest) || !/^[a-f0-9]{64}$/.test(manifest.archiveSha256 || "") || manifest.archiveSha256 !== archiveSha256 || !Array.isArray(manifest.entries) || manifest.entries.length > limits.maxPhotoReferences) fail4("MEDIA_MANIFEST_INVALID");
-  const validUntil = typeof manifest.validUntil === "string" && /^\d{4}-\d{2}-\d{2}T/.test(manifest.validUntil) ? Date.parse(manifest.validUntil) : NaN;
-  if (!Number.isFinite(validUntil) || !Number.isFinite(checkedAt)) fail4("MEDIA_MANIFEST_INVALID");
-  if (checkedAt > validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
-  const byReference = /* @__PURE__ */ new Map();
-  let totalBytes = 0;
-  for (const entry of manifest.entries) {
-    if (!object2(entry)) fail4("MEDIA_MANIFEST_INVALID");
-    validateReference(entry.reference);
-    if (byReference.has(entry.reference) || typeof entry.version !== "string" || !entry.version || entry.version !== entry.version.trim() || entry.version.length > 256 || /[\x00-\x1f\x7f]/.test(entry.version) || [archiveSha256, `sha256:${archiveSha256}`].includes(entry.version) || !MIME_TYPES2.has(entry.mimeType) || !Number.isSafeInteger(entry.sizeInBytes) || entry.sizeInBytes <= 0 || entry.sizeInBytes > limits.maxImageBytes || entry.contentHash !== void 0 && !/^[a-f0-9]{64}$/.test(entry.contentHash)) fail4("MEDIA_MANIFEST_INVALID");
-    totalBytes += entry.sizeInBytes;
-    if (totalBytes > limits.maxTotalImageBytes) fail4("MEDIA_TOTAL_LIMIT_EXCEEDED");
-    byReference.set(entry.reference, {
-      reference: entry.reference,
-      version: entry.version,
-      mimeType: entry.mimeType,
-      sizeInBytes: entry.sizeInBytes,
-      ...entry.contentHash !== void 0 ? { contentHash: entry.contentHash } : {}
-    });
-  }
   const unique = /* @__PURE__ */ new Map();
-  const usedReferences = /* @__PURE__ */ new Set();
   const listings = draft.listings.map(({ fields, photoReferences }) => ({
     fields,
     photos: photoReferences.map(({ reference, alt }) => {
       validateReference(reference);
-      const input = byReference.get(reference);
-      if (!input) fail4("MEDIA_MANIFEST_MISMATCH");
-      usedReferences.add(reference);
-      const key = JSON.stringify([input.reference, input.version]);
-      if (!unique.has(key)) unique.set(key, input);
+      const key = JSON.stringify([reference, SOURCE_URL_VERSION]);
+      if (!unique.has(key)) unique.set(key, { reference, version: SOURCE_URL_VERSION });
       return { key, alt };
     })
   }));
-  if (usedReferences.size !== byReference.size) fail4("MEDIA_MANIFEST_MISMATCH");
-  return { listings, unique, direct: true, validUntil };
+  return { listings, unique };
 }
-async function photoInputs(draft, limits, readRemotePhotos, archiveBytes, checkedAt) {
-  if (!["FULL", "URL"].includes(draft.photoMode)) fail4("HEKTOR_PHOTO_MODE_UNSUPPORTED");
-  const isRemote = draft.photoMode === "URL";
-  const references = draft.listings.flatMap((item) => item.photoReferences.map((photo) => photo.reference));
-  if (references.length > limits.maxPhotoReferences) fail4("MEDIA_REFERENCE_LIMIT_EXCEEDED");
-  let remote;
-  if (isRemote) {
-    if (limits.remote?.enabled !== true) fail4("HEKTOR_URL_PHOTOS_NOT_CONFIGURED");
-    if (!remoteMediaReadiness({ ...limits.remote, maxImageBytes: limits.maxImageBytes }).configurationReady) fail4("MEDIA_REMOTE_CONFIG_INVALID");
-    if (limits.remote.importMode === "wix-url") return directPhotoInputs(draft, limits, archiveBytes, checkedAt);
-    if (limits.remote.importMode !== void 0 && limits.remote.importMode !== "bytes") fail4("MEDIA_REMOTE_CONFIG_INVALID");
-    if (typeof readRemotePhotos !== "function") fail4("MEDIA_REMOTE_READER_UNAVAILABLE");
-    remote = await readRemotePhotos(references);
-    if (!(remote?.photos instanceof Map)) fail4("MEDIA_FETCH_FAILED");
-    const stats = remote.stats;
-    if (!stats || !["requestCount", "downloadedBytes", "uniqueUrlCount"].every((key) => Number.isSafeInteger(stats[key]) && stats[key] >= 0)) fail4("MEDIA_FETCH_FAILED");
-    remote = { photos: remote.photos, stats: {
-      requestCount: stats.requestCount,
-      downloadedBytes: stats.downloadedBytes,
-      uniqueUrlCount: stats.uniqueUrlCount
-    } };
-  }
-  const unique = /* @__PURE__ */ new Map();
-  const inspected = /* @__PURE__ */ new WeakMap();
-  let totalBytes = 0;
-  const listings = draft.listings.map(({ fields, photoReferences }) => ({
-    fields,
-    photos: photoReferences.map(({ reference, alt }) => {
-      if (!isRemote && (typeof reference !== "string" || !reference || reference.length > 1024 || reference.startsWith("/") || /[\\\x00-\x1f\x7f%?#:]/.test(reference) || reference.split("/").some((part) => !part || part === "." || part === ".."))) fail4("MEDIA_ARCHIVE_PATH_INVALID");
-      const bytes = isRemote ? remote.photos.get(reference)?.bytes : draft.mediaEntries.get(reference);
-      if (!Buffer.isBuffer(bytes)) fail4(isRemote ? "MEDIA_FETCH_FAILED" : "MEDIA_ARCHIVE_FILE_MISSING");
-      if (!bytes.length || bytes.length > limits.maxImageBytes) fail4("MEDIA_TOO_LARGE");
-      let verified = inspected.get(bytes);
-      if (!verified) {
-        const image2 = inspectRaster(bytes);
-        const key2 = createHash3("sha256").update(`${image2.contentType}\0`).update(bytes).digest("hex");
-        verified = { image: image2, key: key2 };
-        inspected.set(bytes, verified);
-      }
-      const { image, key } = verified;
-      if (isRemote) {
-        if (remote.photos.get(reference).contentType !== image.contentType) fail4("MEDIA_CONTENT_TYPE_MISMATCH");
-      } else {
-        const extension = reference.toLowerCase().split(".").at(-1).replace(/^jpeg$/, "jpg");
-        if (extension !== image.extension) fail4("MEDIA_CONTENT_TYPE_MISMATCH");
-      }
-      if (!unique.has(key)) {
-        totalBytes += bytes.length;
-        if (totalBytes > limits.maxTotalImageBytes) fail4("MEDIA_TOTAL_LIMIT_EXCEEDED");
-        unique.set(key, { bytes, mimeType: image.contentType });
-      }
-      return { key, alt };
-    })
-  }));
-  return { listings, unique, ...remote ? { remoteStats: remote.stats } : {} };
-}
-function createHektorIngest(config, { readSource, prepareArchive, mediaStore, readRemotePhotos, now = Date.now }) {
+function createHektorIngest(config, { readSource, prepareArchive, mediaStore, now = Date.now }) {
   for (const fn of [readSource, prepareArchive, now]) {
-    if (typeof fn !== "function") fail4("HEKTOR_INGEST_DEPENDENCIES_INVALID");
+    if (typeof fn !== "function") fail3("HEKTOR_INGEST_DEPENDENCIES_INVALID");
   }
-  if (!object2(mediaStore)) fail4("HEKTOR_INGEST_DEPENDENCIES_INVALID");
-  if (config?.media?.maxRunMs !== void 0 && (!Number.isSafeInteger(config.media.maxRunMs) || config.media.maxRunMs <= 0)) fail4("MEDIA_INVALID_LIMIT");
+  if (!object2(mediaStore) || ["inspectRemote", "commitReadyMany", "ensureRemoteMany"].some((name) => typeof mediaStore[name] !== "function")) fail3("HEKTOR_INGEST_DEPENDENCIES_INVALID");
+  if (config?.media?.maxRunMs !== void 0 && (!Number.isSafeInteger(config.media.maxRunMs) || config.media.maxRunMs <= 0)) fail3("MEDIA_INVALID_LIMIT");
   async function prepare({ allowMediaWrites = false, unchangedSince } = {}) {
     const started = now();
     const readiness = hektorSftpReadiness(config);
-    if (!readiness.configurationReady) fail4("HEKTOR_SOURCE_NOT_CONFIGURED");
+    if (!readiness.configurationReady) fail3("HEKTOR_SOURCE_NOT_CONFIGURED");
     const read = await readSource(config.sftp, unchangedSince ? { unchangedSince } : void 0);
     if (read?.unchanged === true) return { unchanged: true, snapshot: null, summary: null, source: read.context };
     const { bytes, context } = read;
@@ -2470,56 +2165,36 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
       maxSnapshotAgeMs: config.maxAgeMs
     });
     const summary = summarizePreparedFeed(draft);
-    const inputs = await photoInputs(draft, config.media, readRemotePhotos, bytes, now());
-    if ([
-      inputs.direct ? mediaStore.inspectRemote : mediaStore.inspectReady,
-      inputs.direct ? mediaStore.ensureRemote : mediaStore.ensureReady
-    ].some((fn) => typeof fn !== "function")) {
-      fail4("HEKTOR_INGEST_DEPENDENCIES_INVALID");
-    }
-    const inspect = inputs.direct ? (input) => mediaStore.inspectRemote(input) : (input) => mediaStore.inspectReady(input);
+    const inputs = photoInputs(draft, config.media);
     const states = /* @__PURE__ */ new Map();
-    if (inputs.direct && typeof mediaStore.prefetchRemote === "function") {
+    if (typeof mediaStore.prefetchRemote === "function") {
       await mediaStore.prefetchRemote([...inputs.unique.values()]);
     }
     const pending = [...inputs.unique];
     await Promise.all(Array.from({ length: Math.min(8, pending.length) }, async () => {
       while (pending.length) {
         const [key, input] = pending.shift();
-        states.set(key, await inspect(input));
+        states.set(key, await mediaStore.inspectRemote(input));
       }
     }));
     let attempted = 0;
     let budgetExhausted = false;
-    const grouped = Boolean(inputs.direct) && typeof mediaStore.commitReadyMany === "function" && typeof mediaStore.ensureRemoteMany === "function";
-    if (allowMediaWrites && inputs.direct && grouped) {
+    if (allowMediaWrites) {
       const keys = [...inputs.unique.keys()].filter((key) => states.get(key)?.ready && states.get(key).needsPersistence === true);
       if (keys.length) {
-        if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
         const committed = await mediaStore.commitReadyMany(keys.map((key) => states.get(key)));
         keys.forEach((key, index) => states.set(key, committed[index]));
       }
-    } else if (allowMediaWrites && inputs.direct) {
-      for (const [key, input] of inputs.unique) {
-        const state = states.get(key);
-        if (!state?.ready || state.needsPersistence !== true) continue;
-        if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
-        if (config.media.maxRunMs !== void 0 && now() - started >= config.media.maxRunMs) {
-          budgetExhausted = true;
-          break;
-        }
-        states.set(key, await mediaStore.ensureRemote(input));
-      }
     }
-    const omitFailed = Boolean(inputs.direct) && config.media.remote?.failedPhotos === "omit";
+    const omitFailed = config.media.remote?.failedPhotos === "omit";
     const recoveryRequired = [...states.values()].some((state) => state?.status === "recovery-required" || !omitFailed && state?.status === "failed");
-    if (allowMediaWrites && !recoveryRequired && !budgetExhausted && grouped) {
+    if (allowMediaWrites && !recoveryRequired) {
       const missing = [...inputs.unique].filter(([key]) => states.get(key)?.status === "missing").slice(0, config.media.maxOperationsPerRun);
       if (missing.length) {
-        if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
         const remote = config.media.remote || {};
         const batch = await mediaStore.ensureRemoteMany(missing.map(([, input]) => input), {
-          // Admission limit only, as below: a started chunk always completes.
+          // Admission limit only: a started chunk always completes, and a
+          // timeout never authorizes a second import.
           admit: () => config.media.maxRunMs === void 0 || now() - started < config.media.maxRunMs,
           ...remote.batchSize !== void 0 ? { chunkSize: remote.batchSize } : {},
           ...remote.concurrency !== void 0 ? { concurrency: remote.concurrency } : {}
@@ -2530,29 +2205,6 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
         attempted = batch.attempted;
         budgetExhausted = batch.stopped === true;
       }
-    } else if (allowMediaWrites && !recoveryRequired && !budgetExhausted) {
-      for (const [key, input] of inputs.unique) {
-        const state = states.get(key);
-        if (state.ready || state.status === "recovery-required" || state.status === "failed") continue;
-        if (inputs.direct && state.status !== "missing") continue;
-        if (attempted >= config.media.maxOperationsPerRun) break;
-        if (inputs.direct && now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
-        if (config.media.maxRunMs !== void 0 && now() - started >= config.media.maxRunMs) {
-          budgetExhausted = true;
-          break;
-        }
-        attempted++;
-        try {
-          if (inputs.direct) states.set(key, await mediaStore.ensureRemote(input));
-          else {
-            const media4 = await mediaStore.ensureReady(input);
-            states.set(key, { ready: true, ...media4 });
-          }
-        } catch (error) {
-          if (error.message !== "MEDIA_NOT_READY") throw error;
-          states.set(key, { ready: false, status: "pending" });
-        }
-      }
     }
     const media3 = { ready: 0, missing: 0, pending: 0, recoveryRequired: 0, attempted };
     for (const state of states.values()) {
@@ -2561,29 +2213,19 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
       else if (state?.status === "pending") media3.pending++;
       else if (state?.status === "recovery-required") media3.recoveryRequired++;
       else if (state?.status === "failed") media3.failed = (media3.failed || 0) + 1;
-      else fail4("MEDIA_STATUS_INVALID");
+      else fail3("MEDIA_STATUS_INVALID");
     }
     const failed = media3.failed || 0;
     const elapsedMs = Math.max(0, now() - started);
-    if (inputs.direct) {
-      media3.elapsedMs = elapsedMs;
-      media3.durationBudgetReached = config.media.maxRunMs !== void 0 && elapsedMs >= config.media.maxRunMs;
-      if (now() > inputs.validUntil) fail4("MEDIA_SOURCE_VERSION_EXPIRED");
-    }
-    const persistenceRequired = allowMediaWrites && inputs.direct && [...states.values()].some((state) => state?.needsPersistence === true);
+    media3.elapsedMs = elapsedMs;
+    media3.durationBudgetReached = config.media.maxRunMs !== void 0 && elapsedMs >= config.media.maxRunMs;
+    const persistenceRequired = allowMediaWrites && [...states.values()].some((state) => state?.needsPersistence === true);
     const ready = media3.ready + (omitFailed ? failed : 0) === inputs.unique.size && !persistenceRequired && (omitFailed || !failed);
     const resultSummary = {
       ...summary,
       uniqueImageCount: inputs.unique.size,
       media: media3,
-      ...inputs.remoteStats ? { remoteDownloads: inputs.remoteStats } : {},
-      ...inputs.direct ? { remoteImports: {
-        mode: "wix-url",
-        checked: states.size,
-        attempted,
-        budgetExhausted,
-        elapsedMs
-      } } : {},
+      remoteImports: { mode: "wix-url", checked: states.size, attempted, budgetExhausted, elapsedMs },
       ...failed && omitFailed ? { omittedPhotos: failed } : {},
       snapshotReady: ready,
       status: ready ? "prepared" : "needs-media",
@@ -2618,7 +2260,7 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
       return (await prepare()).summary;
     },
     async stageFeedMedia() {
-      if (config.mediaPreparationEnabled !== true) fail4("HEKTOR_MEDIA_PREPARATION_DISABLED");
+      if (config.mediaPreparationEnabled !== true) fail3("HEKTOR_MEDIA_PREPARATION_DISABLED");
       return (await prepare({ allowMediaWrites: true })).summary;
     },
     /**
@@ -2628,14 +2270,14 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
      * file is the one named by unchangedSince.
      */
     async runFeed({ allowMediaWrites = false, unchangedSince } = {}) {
-      if (config.enabled !== true) fail4("HEKTOR_SYNC_DISABLED");
-      if (allowMediaWrites && config.mediaPreparationEnabled !== true) fail4("HEKTOR_MEDIA_PREPARATION_DISABLED");
+      if (config.enabled !== true) fail3("HEKTOR_SYNC_DISABLED");
+      if (allowMediaWrites && config.mediaPreparationEnabled !== true) fail3("HEKTOR_MEDIA_PREPARATION_DISABLED");
       return prepare({ allowMediaWrites, unchangedSince });
     },
     async readSnapshot({ dryRun = true } = {}) {
-      if (!dryRun && config.enabled !== true) fail4("HEKTOR_SYNC_DISABLED");
+      if (!dryRun && config.enabled !== true) fail3("HEKTOR_SYNC_DISABLED");
       const result = await prepare({ allowMediaWrites: !dryRun });
-      if (!result.snapshot) fail4("HEKTOR_MEDIA_NOT_READY");
+      if (!result.snapshot) fail3("HEKTOR_MEDIA_NOT_READY");
       return result.snapshot;
     }
   });
@@ -2643,9 +2285,7 @@ function createHektorIngest(config, { readSource, prepareArchive, mediaStore, re
 
 // velo/backend/hektor-sync.js
 import crypto2 from "crypto";
-import { Buffer as Buffer3 } from "buffer";
 import wixData2 from "wix-data";
-import { fetch } from "wix-fetch";
 import SftpClient from "ssh2-sftp-client";
 import yauzl from "yauzl";
 
@@ -2661,10 +2301,10 @@ async function secretValue(name) {
 }
 
 // velo/backend/hektor-sftp.js
-import { createHash as createHash4, timingSafeEqual } from "crypto";
+import { createHash as createHash3, timingSafeEqual } from "crypto";
 import { Socket } from "net";
 import { Writable } from "stream";
-var DEFAULTS4 = Object.freeze({
+var DEFAULTS3 = Object.freeze({
   maxFileBytes: 32 * 1024 * 1024,
   minFileAgeMs: 60 * 1e3,
   maxFileAgeMs: 36 * 60 * 60 * 1e3,
@@ -2679,42 +2319,42 @@ var SftpReadError = class extends Error {
     this.code = code;
   }
 };
-var fail5 = (code) => {
+var fail4 = (code) => {
   throw new SftpReadError(code);
 };
 function integer(value, min, max) {
-  if (!Number.isSafeInteger(value) || value < min || value > max) fail5("SFTP_CONFIG_INVALID");
+  if (!Number.isSafeInteger(value) || value < min || value > max) fail4("SFTP_CONFIG_INVALID");
   return value;
 }
-function settings2(input) {
-  const config = { ...DEFAULTS4, ...input };
-  if (typeof config.host !== "string" || config.host.length > 253 || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(config.host) || typeof config.remoteFile !== "string" || config.remoteFile.length > 1024 || !config.remoteFile.startsWith("/") || !/\.zip$/i.test(config.remoteFile) || /[\x00-\x1f\x7f\\]/.test(config.remoteFile) || config.remoteFile.split("/").some((part) => part === "." || part === "..") || !/^[A-Za-z0-9_-]{1,128}$/.test(config.usernameSecret || "") || !/^[A-Za-z0-9_-]{1,128}$/.test(config.passwordSecret || "")) fail5("SFTP_CONFIG_INVALID");
+function settings(input) {
+  const config = { ...DEFAULTS3, ...input };
+  if (typeof config.host !== "string" || config.host.length > 253 || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(config.host) || typeof config.remoteFile !== "string" || config.remoteFile.length > 1024 || !config.remoteFile.startsWith("/") || !/\.zip$/i.test(config.remoteFile) || /[\x00-\x1f\x7f\\]/.test(config.remoteFile) || config.remoteFile.split("/").some((part) => part === "." || part === "..") || !/^[A-Za-z0-9_-]{1,128}$/.test(config.usernameSecret || "") || !/^[A-Za-z0-9_-]{1,128}$/.test(config.passwordSecret || "")) fail4("SFTP_CONFIG_INVALID");
   integer(config.maxFileBytes, 1, 128 * 1024 * 1024);
   integer(config.minFileAgeMs, 1e3, 60 * 60 * 1e3);
   integer(config.maxFileAgeMs, config.minFileAgeMs, 7 * 24 * 60 * 60 * 1e3);
   integer(config.stabilityMs, 1e3, 1e4);
   integer(config.timeoutMs, config.stabilityMs + 100, 6e4);
   integer(config.cleanupTimeoutMs, 10, 2e3);
-  if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(config.hostFingerprint || "")) fail5("SFTP_HOST_FINGERPRINT_INVALID");
+  if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(config.hostFingerprint || "")) fail4("SFTP_HOST_FINGERPRINT_INVALID");
   const fingerprintBytes = Buffer.from(config.hostFingerprint.slice(7), "base64");
   if (fingerprintBytes.length !== 32 || fingerprintBytes.toString("base64").replace(/=+$/, "") !== config.hostFingerprint.slice(7)) {
-    fail5("SFTP_HOST_FINGERPRINT_INVALID");
+    fail4("SFTP_HOST_FINGERPRINT_INVALID");
   }
   return { ...config, fingerprintBytes };
 }
 function checkFile(stat, config, now) {
-  if (!stat || stat.isFile !== true || stat.isSymbolicLink === true || !Number.isSafeInteger(stat.size) || stat.size <= 0) fail5("SFTP_FILE_INVALID");
-  if (stat.size > config.maxFileBytes) fail5("SFTP_FILE_TOO_LARGE");
-  if (!Number.isFinite(stat.modifyTime) || stat.modifyTime < 0) fail5("SFTP_FILE_TIME_INVALID");
+  if (!stat || stat.isFile !== true || stat.isSymbolicLink === true || !Number.isSafeInteger(stat.size) || stat.size <= 0) fail4("SFTP_FILE_INVALID");
+  if (stat.size > config.maxFileBytes) fail4("SFTP_FILE_TOO_LARGE");
+  if (!Number.isFinite(stat.modifyTime) || stat.modifyTime < 0) fail4("SFTP_FILE_TIME_INVALID");
   const age = now - stat.modifyTime;
-  if (age < config.minFileAgeMs) fail5("SFTP_FILE_TOO_RECENT");
-  if (age > config.maxFileAgeMs) fail5("SFTP_FILE_STALE");
+  if (age < config.minFileAgeMs) fail4("SFTP_FILE_TOO_RECENT");
+  if (age > config.maxFileAgeMs) fail4("SFTP_FILE_STALE");
 }
 function unchanged(before, after) {
-  if (!after || after.size !== before.size || after.modifyTime !== before.modifyTime || after.isFile !== true || after.isSymbolicLink === true) fail5("SFTP_FILE_CHANGED");
+  if (!after || after.size !== before.size || after.modifyTime !== before.modifyTime || after.isFile !== true || after.isSymbolicLink === true) fail4("SFTP_FILE_CHANGED");
 }
 async function readHektorSftp(input, dependencies) {
-  const config = settings2(input);
+  const config = settings(input);
   const {
     createClient,
     readSecret,
@@ -2723,8 +2363,8 @@ async function readHektorSftp(input, dependencies) {
     wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     unchangedSince
   } = dependencies || {};
-  if (typeof createClient !== "function" || typeof readSecret !== "function") fail5("SFTP_CONFIG_INVALID");
-  if (unchangedSince !== void 0 && (unchangedSince === null || typeof unchangedSince !== "object" || !Number.isSafeInteger(unchangedSince.size) || unchangedSince.size <= 0 || typeof unchangedSince.sourceModifiedAt !== "string" || !Number.isFinite(Date.parse(unchangedSince.sourceModifiedAt)))) fail5("SFTP_CONFIG_INVALID");
+  if (typeof createClient !== "function" || typeof readSecret !== "function") fail4("SFTP_CONFIG_INVALID");
+  if (unchangedSince !== void 0 && (unchangedSince === null || typeof unchangedSince !== "object" || !Number.isSafeInteger(unchangedSince.size) || unchangedSince.size <= 0 || typeof unchangedSince.sourceModifiedAt !== "string" || !Number.isFinite(Date.parse(unchangedSince.sourceModifiedAt)))) fail4("SFTP_CONFIG_INVALID");
   let client, socket, writer, timer, stopped = false, closing = false;
   let failure, rejectFailure, phase = "SFTP_SECRET_UNAVAILABLE";
   const failed = new Promise((_, reject) => {
@@ -2750,7 +2390,7 @@ async function readHektorSftp(input, dependencies) {
       readSecret(config.passwordSecret)
     ]);
     active();
-    if (typeof username !== "string" || !username.trim() || username.length > 256 || typeof password !== "string" || !password || password.length > 1024) fail5("SFTP_SECRET_INVALID");
+    if (typeof username !== "string" || !username.trim() || username.length > 256 || typeof password !== "string" || !password || password.length > 1024) fail4("SFTP_SECRET_INVALID");
     phase = "SFTP_CONNECTION_FAILED";
     client = createClient();
     socket = createSocket();
@@ -2773,7 +2413,7 @@ async function readHektorSftp(input, dependencies) {
       keepaliveCountMax: 2,
       hostVerifier: (key) => {
         const matches = Buffer.isBuffer(key) && timingSafeEqual(
-          createHash4("sha256").update(key).digest(),
+          createHash3("sha256").update(key).digest(),
           config.fingerprintBytes
         );
         if (!matches) abort("SFTP_HOST_KEY_REJECTED");
@@ -2817,13 +2457,13 @@ async function readHektorSftp(input, dependencies) {
       readStreamOptions: { flags: "r", encoding: null, autoClose: true, highWaterMark: 32768 }
     }), finished]);
     active();
-    if (received !== before.size) fail5("SFTP_FILE_CHANGED");
+    if (received !== before.size) fail4("SFTP_FILE_CHANGED");
     unchanged(before, await client.stat(config.remoteFile));
     active();
     return {
       bytes,
       context: {
-        rawSha256: createHash4("sha256").update(bytes).digest("hex"),
+        rawSha256: createHash3("sha256").update(bytes).digest("hex"),
         sourceModifiedAt: new Date(before.modifyTime).toISOString()
       }
     };
@@ -2857,139 +2497,31 @@ async function readHektorSftp(input, dependencies) {
 
 // velo/backend/hektor-media.js
 import crypto from "crypto";
-import { Buffer as Buffer2 } from "buffer";
 import wixData from "wix-data";
 import { mediaManager } from "wix-media-backend";
 import { files } from "wix-media.v2";
 import { elevate as elevate2 } from "wix-auth";
 import { media } from "@wix/sdk";
 
-// velo/backend/lib/media-cache.js
-var EXTENSIONS = Object.freeze({
-  "image/jpeg": "jpg",
-  "image/png": "png",
-  "image/webp": "webp",
-  "image/gif": "gif"
-});
-var fail6 = (code) => {
+// velo/backend/lib/media-url-cache.js
+var fail5 = (code) => {
   throw new Error(code);
 };
 var object3 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-var imageUri = (value) => typeof value === "string" && /^wix:image:\/\/v1\/[^\s/?#]+\/[^\s#]+(?:#[^\s]*)?$/.test(value);
-function publicImageUrl(value) {
+var MIME_TYPES = /* @__PURE__ */ new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"]);
+var imageId = (value) => typeof value === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s?#]+(?:#[^\s]*)?$/.exec(value)?.[1];
+function sourceReference(value) {
+  if (typeof value !== "string" || !value || value.length > 2048 || value !== value.trim()) fail5("MEDIA_INVALID_SOURCE_URL");
   let url;
   try {
     url = new URL(value);
   } catch {
-    fail6("MEDIA_INVALID_PUBLIC_URL");
+    fail5("MEDIA_INVALID_SOURCE_URL");
   }
-  if (url.protocol !== "https:" || url.hostname !== "static.wixstatic.com" || url.port || url.username || url.password || url.search || url.hash || !/^\/media\/[^/]+$/.test(url.pathname)) fail6("MEDIA_INVALID_PUBLIC_URL");
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash) fail5("MEDIA_INVALID_SOURCE_URL");
   return url.href;
 }
 async function call(operation, code, ...args) {
-  try {
-    return await operation(...args);
-  } catch {
-    fail6(code);
-  }
-}
-function createMediaCache({ hash: hash2, lookup: lookup2, save, upload, checkReady, resolvePublicUrl }, {
-  maxImageBytes = 15 * 1024 * 1024
-} = {}) {
-  for (const fn of [hash2, lookup2, save, upload, checkReady, resolvePublicUrl]) {
-    if (typeof fn !== "function") fail6("MEDIA_INVALID_DEPENDENCIES");
-  }
-  if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes < 1) fail6("MEDIA_INVALID_LIMIT");
-  const inFlight = /* @__PURE__ */ new Map();
-  async function resolve(bytes, mimeType, key, prepare) {
-    let record = await call(lookup2, "MEDIA_CACHE_READ_FAILED", key);
-    if (record !== null) {
-      if (!object3(record) || record.key !== key || record.mimeType !== mimeType || record.sizeInBytes !== bytes.byteLength || !["uploading", "unresolved", "pending", "ready"].includes(record.status)) fail6("MEDIA_CACHE_CONFLICT");
-      if (!record.fileUrl) fail6("MEDIA_RECOVERY_REQUIRED");
-      if (!imageUri(record.fileUrl)) fail6("MEDIA_CACHE_CONFLICT");
-    } else {
-      if (!prepare) fail6("MEDIA_NOT_CACHED");
-      record = { key, mimeType, sizeInBytes: bytes.byteLength, status: "uploading" };
-      await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
-      let uploaded;
-      try {
-        uploaded = await upload({ bytes, mimeType, key, fileName: `${key}.${EXTENSIONS[mimeType]}` });
-      } catch {
-        fail6("MEDIA_UPLOAD_UNCERTAIN");
-      }
-      if (!object3(uploaded) || !imageUri(uploaded.fileUrl)) {
-        await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "unresolved" });
-        fail6("MEDIA_INCOMPLETE_UPLOAD_RESPONSE");
-      }
-      record = { ...record, status: "pending", fileUrl: uploaded.fileUrl };
-      await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
-    }
-    const info = await call(checkReady, "MEDIA_STATUS_CHECK_FAILED", record.fileUrl);
-    if (!object3(info) || info.fileUrl !== record.fileUrl) fail6("MEDIA_INCOMPLETE_FILE_INFO");
-    if (info.opStatus !== "READY") fail6("MEDIA_NOT_READY");
-    if (info.mediaType !== "image" || info.mimeType !== mimeType || info.isPrivate !== false || !Number.isSafeInteger(info.sizeInBytes) || info.sizeInBytes <= 0 || !Number.isSafeInteger(info.width) || info.width <= 0 || !Number.isSafeInteger(info.height) || info.height <= 0) fail6("MEDIA_INVALID_FILE_INFO");
-    const url = publicImageUrl(await call(resolvePublicUrl, "MEDIA_URL_RESOLUTION_FAILED", record.fileUrl));
-    if (record.publicUrl && record.publicUrl !== url) fail6("MEDIA_CACHE_CONFLICT");
-    if (prepare && (record.status !== "ready" || record.publicUrl !== url)) {
-      await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "ready", publicUrl: url });
-    }
-    return { key, fileUrl: record.fileUrl, url, mimeType, width: info.width, height: info.height };
-  }
-  async function identify({ bytes, mimeType } = {}) {
-    if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > maxImageBytes) fail6("MEDIA_INVALID_BYTES");
-    if (!Object.hasOwn(EXTENSIONS, mimeType)) fail6("MEDIA_UNSUPPORTED_TYPE");
-    const stableBytes = new Uint8Array(bytes);
-    const key = await call(hash2, "MEDIA_HASH_FAILED", stableBytes, mimeType);
-    if (typeof key !== "string" || !/^[a-f0-9]{64}$/.test(key)) fail6("MEDIA_INVALID_HASH");
-    return { bytes: stableBytes, mimeType, key };
-  }
-  async function ensureReady(input) {
-    const { bytes, mimeType, key } = await identify(input);
-    if (inFlight.has(key)) return inFlight.get(key);
-    const pending = resolve(bytes, mimeType, key, true);
-    inFlight.set(key, pending);
-    try {
-      return await pending;
-    } finally {
-      inFlight.delete(key);
-    }
-  }
-  async function inspectReady(input) {
-    const { bytes, mimeType, key } = await identify(input);
-    try {
-      return { ready: true, ...await resolve(bytes, mimeType, key, false) };
-    } catch (error) {
-      const states = {
-        MEDIA_NOT_CACHED: "missing",
-        MEDIA_NOT_READY: "pending",
-        MEDIA_RECOVERY_REQUIRED: "recovery-required"
-      };
-      if (Object.hasOwn(states, error.message)) return { ready: false, key, status: states[error.message] };
-      throw error;
-    }
-  }
-  return Object.freeze({ ensureReady, inspectReady });
-}
-
-// velo/backend/lib/media-url-cache.js
-var fail7 = (code) => {
-  throw new Error(code);
-};
-var object4 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-var MIME_TYPES3 = /* @__PURE__ */ new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"]);
-var imageId = (value) => typeof value === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s?#]+(?:#[^\s]*)?$/.exec(value)?.[1];
-function sourceReference(value) {
-  if (typeof value !== "string" || !value || value.length > 2048 || value !== value.trim()) fail7("MEDIA_INVALID_SOURCE_URL");
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    fail7("MEDIA_INVALID_SOURCE_URL");
-  }
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash) fail7("MEDIA_INVALID_SOURCE_URL");
-  return url.href;
-}
-async function call2(operation, code, ...args) {
   try {
     return await operation(...args);
   } catch (error) {
@@ -2999,12 +2531,12 @@ async function call2(operation, code, ...args) {
       message: error?.message || String(error),
       details: error?.details || null
     }));
-    fail7(code);
+    fail5(code);
   }
 }
 function createMediaUrlCache({
   hashReference,
-  lookup: lookup2,
+  lookup,
   save,
   importFile,
   checkReady,
@@ -3020,74 +2552,61 @@ function createMediaUrlCache({
   // every hourly run would exceed the backend time limits.
   trustReadyRecords = false
 } = {}) {
-  for (const fn of [hashReference, lookup2, save, importFile, checkReady, resolvePublicUrl]) {
-    if (typeof fn !== "function") fail7("MEDIA_INVALID_DEPENDENCIES");
+  for (const fn of [hashReference, lookup, save, importFile, checkReady, resolvePublicUrl]) {
+    if (typeof fn !== "function") fail5("MEDIA_INVALID_DEPENDENCIES");
   }
-  if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes < 1) fail7("MEDIA_INVALID_LIMIT");
-  if (typeof createOperationId !== "function" || lookupReceipt !== void 0 && typeof lookupReceipt !== "function") fail7("MEDIA_INVALID_DEPENDENCIES");
+  if (!Number.isSafeInteger(maxImageBytes) || maxImageBytes < 1) fail5("MEDIA_INVALID_LIMIT");
+  if (typeof createOperationId !== "function" || lookupReceipt !== void 0 && typeof lookupReceipt !== "function") fail5("MEDIA_INVALID_DEPENDENCIES");
   for (const fn of [saveMany, forgetReceipts]) {
-    if (fn !== void 0 && typeof fn !== "function") fail7("MEDIA_INVALID_DEPENDENCIES");
+    if (fn !== void 0 && typeof fn !== "function") fail5("MEDIA_INVALID_DEPENDENCIES");
   }
   const inFlight = /* @__PURE__ */ new Map();
   const state = (key, status) => ({ ready: false, key, status });
   const unpersisted = /* @__PURE__ */ new WeakMap();
   async function persist(records) {
     if (!records.length) return;
-    if (saveMany) await call2(saveMany, "MEDIA_CACHE_WRITE_FAILED", records);
-    else for (const record of records) await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
+    if (saveMany) await call(saveMany, "MEDIA_CACHE_WRITE_FAILED", records);
+    else for (const record of records) await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
   }
-  async function identify({ reference, version, mimeType, sizeInBytes, contentHash } = {}) {
+  async function identify({ reference, version } = {}) {
     const sourceUrl = sourceReference(reference);
-    if (version !== void 0 && (typeof version !== "string" || !version || version.length > 256 || version !== version.trim() || /[\x00-\x1f\x7f]/.test(version))) fail7("MEDIA_INVALID_SOURCE_VERSION");
-    if (mimeType !== void 0 && !MIME_TYPES3.has(mimeType)) fail7("MEDIA_INVALID_SOURCE_MIME");
-    if (sizeInBytes !== void 0 && (!Number.isSafeInteger(sizeInBytes) || sizeInBytes <= 0 || sizeInBytes > maxImageBytes)) fail7("MEDIA_TOO_LARGE");
-    if (contentHash !== void 0 && (typeof contentHash !== "string" || !/^[a-f0-9]{64}$/u.test(contentHash))) fail7("MEDIA_INVALID_HASH");
-    const key = await call2(hashReference, "MEDIA_HASH_FAILED", sourceUrl, version);
-    if (typeof key !== "string" || !/^[a-f0-9]{64}$/u.test(key)) fail7("MEDIA_INVALID_HASH");
-    return {
-      sourceUrl,
-      key,
-      ...version !== void 0 ? { version } : {},
-      ...mimeType !== void 0 ? { sourceMimeType: mimeType } : {},
-      ...sizeInBytes !== void 0 ? { sourceSizeInBytes: sizeInBytes } : {},
-      ...contentHash !== void 0 ? { contentHash } : {}
-    };
+    if (version !== void 0 && (typeof version !== "string" || !version || version.length > 256 || version !== version.trim() || /[\x00-\x1f\x7f]/.test(version))) fail5("MEDIA_INVALID_SOURCE_VERSION");
+    const key = await call(hashReference, "MEDIA_HASH_FAILED", sourceUrl, version);
+    if (typeof key !== "string" || !/^[a-f0-9]{64}$/u.test(key)) fail5("MEDIA_INVALID_HASH");
+    return { sourceUrl, key, ...version !== void 0 ? { version } : {} };
   }
   function validateRecord(record, identity2) {
-    if (!object4(record) || record.key !== identity2.key || record.sourceUrl !== identity2.sourceUrl || record.version !== identity2.version || !["importing", "unresolved", "pending", "ready", "failed"].includes(record.status)) fail7("MEDIA_CACHE_CONFLICT");
-    for (const name of ["contentHash", "sourceMimeType", "sourceSizeInBytes"]) {
-      if (record[name] !== void 0 && identity2[name] !== void 0 && record[name] !== identity2[name]) fail7("MEDIA_CACHE_CONFLICT");
-    }
-    if (record.operationId !== void 0 && (typeof record.operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(record.operationId))) fail7("MEDIA_CACHE_CONFLICT");
-    if (record.fileUrl !== void 0 && !imageId(record.fileUrl)) fail7("MEDIA_CACHE_CONFLICT");
+    if (!object3(record) || record.key !== identity2.key || record.sourceUrl !== identity2.sourceUrl || record.version !== identity2.version || !["importing", "unresolved", "pending", "ready", "failed"].includes(record.status)) fail5("MEDIA_CACHE_CONFLICT");
+    if (record.operationId !== void 0 && (typeof record.operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(record.operationId))) fail5("MEDIA_CACHE_CONFLICT");
+    if (record.fileUrl !== void 0 && !imageId(record.fileUrl)) fail5("MEDIA_CACHE_CONFLICT");
   }
   async function reconcile(record, identity2, prepare) {
     if (!lookupReceipt || !record.operationId || record.status === "failed") return record;
-    const receipt = await call2(lookupReceipt, "MEDIA_RECEIPT_READ_FAILED", record.operationId);
+    const receipt = await call(lookupReceipt, "MEDIA_RECEIPT_READ_FAILED", record.operationId);
     if (receipt === null) return record;
-    if (!object4(receipt) || receipt.operationId !== record.operationId || receipt.key !== identity2.key || receipt.sourceUrl !== identity2.sourceUrl || receipt.version !== identity2.version || !imageId(receipt.fileUrl) || record.fileUrl && imageId(record.fileUrl) !== imageId(receipt.fileUrl)) fail7("MEDIA_RECEIPT_CONFLICT");
+    if (!object3(receipt) || receipt.operationId !== record.operationId || receipt.key !== identity2.key || receipt.sourceUrl !== identity2.sourceUrl || receipt.version !== identity2.version || !imageId(receipt.fileUrl) || record.fileUrl && imageId(record.fileUrl) !== imageId(receipt.fileUrl)) fail5("MEDIA_RECEIPT_CONFLICT");
     if (["importing", "unresolved"].includes(record.status) || !record.fileUrl) {
       record = { ...record, fileUrl: receipt.fileUrl, status: "pending" };
-      if (prepare) await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
+      if (prepare) await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
     }
     return record;
   }
   async function checked(record, identity2, prepare) {
     const { key } = identity2;
-    const info = await call2(checkReady, "MEDIA_STATUS_CHECK_FAILED", record.fileUrl);
-    if (!object4(info) || !imageId(info.fileUrl) || imageId(info.fileUrl) !== imageId(record.fileUrl) || typeof info.opStatus !== "string" || !info.opStatus) fail7("MEDIA_INCOMPLETE_FILE_INFO");
+    const info = await call(checkReady, "MEDIA_STATUS_CHECK_FAILED", record.fileUrl);
+    if (!object3(info) || !imageId(info.fileUrl) || imageId(info.fileUrl) !== imageId(record.fileUrl) || typeof info.opStatus !== "string" || !info.opStatus) fail5("MEDIA_INCOMPLETE_FILE_INFO");
     if (info.opStatus === "FAILED") {
-      if (prepare) await call2(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "failed" });
+      if (prepare) await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "failed" });
       return state(key, "failed");
     }
     if (info.opStatus !== "READY") return state(key, "pending");
     if (info.fileUrl !== record.fileUrl && info.fileUrl.includes("#")) record = { ...record, fileUrl: info.fileUrl, status: record.status === "ready" ? "pending" : record.status };
-    if (info.mediaType !== "image" || !MIME_TYPES3.has(info.mimeType) || info.isPrivate !== false || identity2.sourceMimeType && info.mimeType !== identity2.sourceMimeType || !Number.isSafeInteger(info.sizeInBytes) || info.sizeInBytes <= 0 || info.sizeInBytes > maxImageBytes || !Number.isSafeInteger(info.width) || info.width <= 0 || !Number.isSafeInteger(info.height) || info.height <= 0) fail7("MEDIA_INVALID_FILE_INFO");
-    const url = await call2(resolvePublicUrl, "MEDIA_URL_RESOLUTION_FAILED", record.fileUrl);
-    if (url !== `https://static.wixstatic.com/media/${imageId(record.fileUrl)}`) fail7("MEDIA_INVALID_PUBLIC_URL");
-    if (record.publicUrl && record.publicUrl !== url) fail7("MEDIA_CACHE_CONFLICT");
+    if (info.mediaType !== "image" || !MIME_TYPES.has(info.mimeType) || info.isPrivate !== false || !Number.isSafeInteger(info.sizeInBytes) || info.sizeInBytes <= 0 || info.sizeInBytes > maxImageBytes || !Number.isSafeInteger(info.width) || info.width <= 0 || !Number.isSafeInteger(info.height) || info.height <= 0) fail5("MEDIA_INVALID_FILE_INFO");
+    const url = await call(resolvePublicUrl, "MEDIA_URL_RESOLUTION_FAILED", record.fileUrl);
+    if (url !== `https://static.wixstatic.com/media/${imageId(record.fileUrl)}`) fail5("MEDIA_INVALID_PUBLIC_URL");
+    if (record.publicUrl && record.publicUrl !== url) fail5("MEDIA_CACHE_CONFLICT");
     if (prepare && (record.status !== "ready" || record.publicUrl !== url)) {
-      await call2(save, "MEDIA_CACHE_WRITE_FAILED", {
+      await call(save, "MEDIA_CACHE_WRITE_FAILED", {
         ...record,
         status: "ready",
         publicUrl: url,
@@ -3120,7 +2639,7 @@ function createMediaUrlCache({
   }
   async function resolve(identity2, prepare) {
     const { sourceUrl, key } = identity2;
-    let record = await call2(lookup2, "MEDIA_CACHE_READ_FAILED", key);
+    let record = await call(lookup, "MEDIA_CACHE_READ_FAILED", key);
     if (record !== null) {
       validateRecord(record, identity2);
       if (trustReadyRecords && record.status === "ready" && imageId(record.fileUrl) && record.publicUrl === `https://static.wixstatic.com/media/${imageId(record.fileUrl)}`) {
@@ -3138,35 +2657,34 @@ function createMediaUrlCache({
       if (["importing", "unresolved"].includes(record.status) || !record.fileUrl) return state(key, "recovery-required");
     } else {
       if (!prepare) return state(key, "missing");
-      const operationId = await call2(createOperationId, "MEDIA_OPERATION_ID_FAILED", identity2);
-      if (typeof operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(operationId)) fail7("MEDIA_INVALID_OPERATION_ID");
+      const operationId = await call(createOperationId, "MEDIA_OPERATION_ID_FAILED", identity2);
+      if (typeof operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(operationId)) fail5("MEDIA_INVALID_OPERATION_ID");
       record = { ...identity2, operationId, status: "importing" };
-      await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
+      await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
       let imported;
       try {
         imported = await importFile({
           reference: sourceUrl,
           key,
           operationId,
-          ...identity2.version !== void 0 ? { version: identity2.version } : {},
-          ...identity2.sourceMimeType ? { mimeType: identity2.sourceMimeType } : {}
+          ...identity2.version !== void 0 ? { version: identity2.version } : {}
         });
       } catch {
-        await call2(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "unresolved" });
+        await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "unresolved" });
         record = await reconcile({ ...record, status: "unresolved" }, identity2, prepare);
         return record.fileUrl ? checked(record, identity2, prepare) : state(key, "recovery-required");
       }
-      if (object4(imported) && imported.opStatus === "FAILED") {
-        await call2(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "failed" });
+      if (object3(imported) && imported.opStatus === "FAILED") {
+        await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "failed" });
         return state(key, "failed");
       }
-      if (!object4(imported) || !imageId(imported.fileUrl) || imported.sourceUrl !== void 0 && imported.sourceUrl !== sourceUrl) {
-        await call2(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "unresolved" });
+      if (!object3(imported) || !imageId(imported.fileUrl) || imported.sourceUrl !== void 0 && imported.sourceUrl !== sourceUrl) {
+        await call(save, "MEDIA_CACHE_WRITE_FAILED", { ...record, status: "unresolved" });
         record = await reconcile({ ...record, status: "unresolved" }, identity2, prepare);
         return record.fileUrl ? checked(record, identity2, prepare) : state(key, "recovery-required");
       }
       record = { ...record, status: "pending", fileUrl: imported.fileUrl };
-      await call2(save, "MEDIA_CACHE_WRITE_FAILED", record);
+      await call(save, "MEDIA_CACHE_WRITE_FAILED", record);
       record = await reconcile(record, identity2, prepare);
     }
     return checked(record, identity2, prepare);
@@ -3185,53 +2703,25 @@ function createMediaUrlCache({
       inFlight.delete(identity2.key);
     }
   }
-  async function adoptRemote(input, { fileUrl, evidence } = {}) {
-    const identity2 = await identify(input);
-    if (!imageId(fileUrl) || !object4(evidence)) fail7("MEDIA_INVALID_ADOPTION");
-    const byteProof = evidence.type === "byte-cache" && identity2.contentHash && evidence.contentHash === identity2.contentHash;
-    const operatorProof = evidence.type === "operator-verified" && evidence.sourceUrl === identity2.sourceUrl && evidence.version === identity2.version && typeof evidence.proof === "string" && evidence.proof.trim().length > 0 && evidence.proof.length <= 2048;
-    if (!byteProof && !operatorProof) fail7("MEDIA_INVALID_ADOPTION");
-    if (inFlight.has(identity2.key)) fail7("MEDIA_CACHE_BUSY");
-    let record = await call2(lookup2, "MEDIA_CACHE_READ_FAILED", identity2.key);
-    if (record !== null) {
-      validateRecord(record, identity2);
-      record = await reconcile(record, identity2, true);
-      if (["importing", "unresolved", "failed"].includes(record.status) || !record.fileUrl) fail7("MEDIA_ADOPTION_REQUIRES_RECOVERY");
-      if (record.fileUrl !== fileUrl) fail7("MEDIA_CACHE_CONFLICT");
-      return checked(record, identity2, true);
-    }
-    record = { ...identity2, fileUrl, status: "pending", adoptionEvidence: evidence };
-    const result = await checked(record, identity2, false);
-    if (!result.ready) fail7("MEDIA_ADOPTION_NOT_READY");
-    await call2(save, "MEDIA_CACHE_WRITE_FAILED", {
-      ...record,
-      status: "ready",
-      publicUrl: result.url,
-      mimeType: result.mimeType,
-      sizeInBytes: result.sizeInBytes
-    });
-    delete result.needsPersistence;
-    return result;
-  }
   async function commitReadyMany(states) {
-    if (!Array.isArray(states)) fail7("MEDIA_INVALID_BATCH");
+    if (!Array.isArray(states)) fail5("MEDIA_INVALID_BATCH");
     const records = [];
     const results = states.map((current) => {
-      const record = object4(current) ? unpersisted.get(current) : void 0;
+      const record = object3(current) ? unpersisted.get(current) : void 0;
       if (!record) return current;
       records.push(record);
       const { needsPersistence, ...committed } = current;
       return committed;
     });
     await persist(records);
-    for (const current of states) if (object4(current)) unpersisted.delete(current);
+    for (const current of states) if (object3(current)) unpersisted.delete(current);
     const operations = records.map((record) => record.operationId).filter(Boolean);
     if (forgetReceipts && operations.length) await forgetReceipts(operations).catch(() => {
     });
     return results;
   }
   async function ensureRemoteMany(inputs, { admit = () => true, chunkSize = 10, concurrency = 5 } = {}) {
-    if (!Array.isArray(inputs) || typeof admit !== "function" || !Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > 100 || !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 20) fail7("MEDIA_INVALID_BATCH");
+    if (!Array.isArray(inputs) || typeof admit !== "function" || !Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > 100 || !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 20) fail5("MEDIA_INVALID_BATCH");
     const identities = [];
     for (const input of inputs) identities.push(await identify(input));
     const states = new Array(inputs.length);
@@ -3252,13 +2742,13 @@ function createMediaUrlCache({
           continue;
         }
         byKey.set(identity2.key, void 0);
-        const existing = await call2(lookup2, "MEDIA_CACHE_READ_FAILED", identity2.key);
+        const existing = await call(lookup, "MEDIA_CACHE_READ_FAILED", identity2.key);
         if (existing !== null) {
           byKey.set(identity2.key, states[index] = await resolve(identity2, true));
           continue;
         }
-        const operationId = await call2(createOperationId, "MEDIA_OPERATION_ID_FAILED", identity2);
-        if (typeof operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(operationId)) fail7("MEDIA_INVALID_OPERATION_ID");
+        const operationId = await call(createOperationId, "MEDIA_OPERATION_ID_FAILED", identity2);
+        if (typeof operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(operationId)) fail5("MEDIA_INVALID_OPERATION_ID");
         fresh.push({ index, identity: identity2, record: { ...identity2, operationId, status: "importing" } });
       }
       await persist(fresh.map((entry) => entry.record));
@@ -3275,15 +2765,14 @@ function createMediaUrlCache({
               reference: identity2.sourceUrl,
               key: identity2.key,
               operationId: record.operationId,
-              ...identity2.version !== void 0 ? { version: identity2.version } : {},
-              ...identity2.sourceMimeType ? { mimeType: identity2.sourceMimeType } : {}
+              ...identity2.version !== void 0 ? { version: identity2.version } : {}
             });
           } catch {
             next = "unresolved";
           }
           if (!next) {
-            if (object4(imported) && imported.opStatus === "FAILED") next = "failed";
-            else if (!object4(imported) || !imageId(imported.fileUrl) || imported.sourceUrl !== void 0 && imported.sourceUrl !== identity2.sourceUrl) next = "unresolved";
+            if (object3(imported) && imported.opStatus === "FAILED") next = "failed";
+            else if (!object3(imported) || !imageId(imported.fileUrl) || imported.sourceUrl !== void 0 && imported.sourceUrl !== identity2.sourceUrl) next = "unresolved";
             else next = "pending";
           }
           outcomes.push({
@@ -3302,14 +2791,14 @@ function createMediaUrlCache({
     }
     return { states, attempted, stopped };
   }
-  return Object.freeze({ inspectRemote, ensureRemote, adoptRemote, ensureRemoteMany, commitReadyMany });
+  return Object.freeze({ inspectRemote, ensureRemote, ensureRemoteMany, commitReadyMany });
 }
 
 // velo/backend/lib/media-readiness.js
-var fail8 = (code) => {
+var fail6 = (code) => {
   throw new Error(code);
 };
-var object5 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+var object4 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 var FORMAT_TO_MIME = Object.freeze({
   JPEG: "image/jpeg",
   JPG: "image/jpeg",
@@ -3335,17 +2824,17 @@ function imageFacts(image) {
     const fragment = new URLSearchParams(image.split("#")[1] || "");
     return { width: parsePositiveInt(fragment.get("originWidth")), height: parsePositiveInt(fragment.get("originHeight")), format: "" };
   }
-  if (!object5(image)) return { width: null, height: null, format: "" };
+  if (!object4(image)) return { width: null, height: null, format: "" };
   return { width: parsePositiveInt(image.width), height: parsePositiveInt(image.height), format: String(image.format || "").toUpperCase() };
 }
 async function readMediaFileInfo(fileUrl, { getFileDescriptor: getFileDescriptor2 }) {
   const match = typeof fileUrl === "string" && /^wix:image:\/\/v1\/([A-Za-z0-9_~.\-]+)\/[^\s#]+(?:#[^\s]*)?$/.exec(fileUrl);
-  if (!match) fail8("MEDIA_INVALID_FILE_URI");
+  if (!match) fail6("MEDIA_INVALID_FILE_URI");
   const fileId = match[1];
   const descriptor = await getFileDescriptor2(fileId);
-  if (!object5(descriptor) || descriptor._id !== fileId || typeof descriptor.operationStatus !== "string" || !descriptor.operationStatus) {
+  if (!object4(descriptor) || descriptor._id !== fileId || typeof descriptor.operationStatus !== "string" || !descriptor.operationStatus) {
     console.info("HEKTOR_MEDIA_DESCRIPTOR_DEBUG", JSON.stringify({ fileId, descriptor }));
-    fail8("MEDIA_INCOMPLETE_FILE_DESCRIPTOR");
+    fail6("MEDIA_INCOMPLETE_FILE_DESCRIPTOR");
   }
   const baseUri = fileUrl.split("#")[0];
   if (descriptor.operationStatus !== "READY") {
@@ -3353,7 +2842,7 @@ async function readMediaFileInfo(fileUrl, { getFileDescriptor: getFileDescriptor
   }
   if (descriptor.private === true || descriptor.state && descriptor.state !== "OK" || String(descriptor.mediaType || "").toUpperCase() !== "IMAGE") {
     console.info("HEKTOR_MEDIA_DESCRIPTOR_DEBUG", JSON.stringify({ fileId, descriptor }));
-    fail8("MEDIA_INVALID_FILE_DESCRIPTOR");
+    fail6("MEDIA_INVALID_FILE_DESCRIPTOR");
   }
   const size = parsePositiveInt(descriptor.sizeInBytes) ?? 1;
   const { width, height, format } = imageFacts(descriptor.media?.image?.image);
@@ -3386,49 +2875,6 @@ function createHektorMediaStore({
   if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(cacheCollection) || !/^\/[a-z0-9/_-]+$/.test(folder) || folder.includes("..")) throw new Error("MEDIA_INVALID_CONFIG");
   const READ2 = { suppressAuth: true, consistentRead: true };
   const WRITE2 = { suppressAuth: true };
-  const idFor2 = (key) => key.slice(0, 32);
-  const byteCache = createMediaCache({
-    hash(bytes, mimeType) {
-      return crypto.createHash("sha256").update(`hektor-media-v1\0${mimeType}\0`, "utf8").update(Buffer2.from(bytes)).digest("hex");
-    },
-    async lookup(key) {
-      const result = await wixData.query(cacheCollection).eq("_id", idFor2(key)).limit(1).find(READ2);
-      const record = result.items[0];
-      if (!record) return null;
-      return {
-        key: record.contentHash,
-        mimeType: record.mimeType,
-        sizeInBytes: record.sizeInBytes,
-        status: record.status,
-        fileUrl: record.fileUrl,
-        publicUrl: record.publicUrl
-      };
-    },
-    async save(record) {
-      await wixData.save(cacheCollection, {
-        _id: idFor2(record.key),
-        contentHash: record.key,
-        mimeType: record.mimeType,
-        sizeInBytes: record.sizeInBytes,
-        status: record.status,
-        ...record.fileUrl ? { fileUrl: record.fileUrl } : {},
-        ...record.publicUrl ? { publicUrl: record.publicUrl } : {},
-        updatedAt: /* @__PURE__ */ new Date()
-      }, WRITE2);
-    },
-    upload({ bytes, mimeType, fileName, key }) {
-      return mediaManager.upload(folder, Buffer2.from(bytes), fileName, {
-        mediaOptions: { mimeType, mediaType: "image" },
-        metadataOptions: {
-          isPrivate: false,
-          isVisitorUpload: false,
-          context: { integration: "hektor", contentHash: key }
-        }
-      });
-    },
-    checkReady: readHektorMediaInfo,
-    resolvePublicUrl: (fileUrl) => media.getImageUrl(fileUrl).url
-  }, { maxImageBytes });
   const urlIdFor = (key) => `url_${key.slice(0, 28)}`;
   const hashReference = (reference, version) => {
     const identity2 = version === void 0 ? `hektor-media-url-v1\0${reference}` : `hektor-media-url-v2\0${reference}\0${version}`;
@@ -3463,14 +2909,7 @@ function createHektorMediaStore({
     ...record.publicUrl ? { publicUrl: record.publicUrl } : {},
     ...record.mimeType ? { mimeType: record.mimeType } : {},
     ...record.sizeInBytes !== void 0 ? { sizeInBytes: record.sizeInBytes } : {},
-    ...Object.fromEntries([
-      "version",
-      "operationId",
-      "contentHash",
-      "sourceMimeType",
-      "sourceSizeInBytes",
-      "adoptionEvidence"
-    ].filter((name) => record[name] !== void 0).map((name) => [name, record[name]])),
+    ...Object.fromEntries(["version", "operationId"].filter((name) => record[name] !== void 0).map((name) => [name, record[name]])),
     updatedAt: /* @__PURE__ */ new Date()
   });
   const urlCache = createMediaUrlCache({
@@ -3488,11 +2927,7 @@ function createHektorMediaStore({
         mimeType: record.mimeType,
         sizeInBytes: record.sizeInBytes,
         version: record.version,
-        operationId: record.operationId,
-        contentHash: record.contentHash,
-        sourceMimeType: record.sourceMimeType,
-        sourceSizeInBytes: record.sourceSizeInBytes,
-        adoptionEvidence: record.adoptionEvidence
+        operationId: record.operationId
       };
     },
     async save(record) {
@@ -3525,11 +2960,11 @@ function createHektorMediaStore({
         fileUrl: receipt.fileUrl
       } : null;
     },
-    async importFile({ reference, key, operationId, version, mimeType }) {
+    async importFile({ reference, key, operationId, version }) {
       const started = Date.now();
       console.info("HEKTOR_MEDIA_IMPORT_START", JSON.stringify({ key, operationId }));
       const result = await mediaManager.importFile(folder, reference, {
-        mediaOptions: { mediaType: "image", ...mimeType ? { mimeType } : {} },
+        mediaOptions: { mediaType: "image" },
         metadataOptions: {
           isPrivate: false,
           isVisitorUpload: false,
@@ -3561,33 +2996,7 @@ function createHektorMediaStore({
     checkReady: readHektorMediaInfo,
     resolvePublicUrl: (fileUrl) => media.getImageUrl(fileUrl).url
   }, { maxImageBytes, trustReadyRecords: true });
-  async function ensureRemote(input) {
-    const current = await urlCache.inspectRemote(input);
-    if (current.status !== "missing" || !input.contentHash) return urlCache.ensureRemote(input);
-    const result = await wixData.query(cacheCollection).eq("_id", idFor2(input.contentHash)).limit(1).find(READ2);
-    const previous = result.items[0];
-    if (!previous) return urlCache.ensureRemote(input);
-    if (previous.contentHash !== input.contentHash || previous.mimeType !== input.mimeType || previous.sizeInBytes !== input.sizeInBytes) throw new Error("MEDIA_CACHE_CONFLICT");
-    if (!previous.fileUrl || !["ready", "pending"].includes(previous.status)) {
-      return { ready: false, key: current.key, status: "recovery-required" };
-    }
-    return urlCache.adoptRemote(input, {
-      fileUrl: previous.fileUrl,
-      evidence: { type: "byte-cache", contentHash: input.contentHash }
-    });
-  }
-  async function ensureRemoteMany(inputs, options = {}) {
-    if (!inputs.some((input) => input.contentHash)) return urlCache.ensureRemoteMany(inputs, options);
-    const states = new Array(inputs.length);
-    let attempted = 0;
-    for (const [index, input] of inputs.entries()) {
-      if (typeof options.admit === "function" && !options.admit()) return { states, attempted, stopped: true };
-      states[index] = await ensureRemote(input);
-      attempted++;
-    }
-    return { states, attempted, stopped: false };
-  }
-  return Object.freeze({ ...byteCache, ...urlCache, ensureRemote, ensureRemoteMany, prefetchRemote });
+  return Object.freeze({ ...urlCache, prefetchRemote });
 }
 
 // velo/backend/lib/sync-engine.js
@@ -3633,7 +3042,9 @@ function toPublicItem(item, { idFor: idFor2, hash: hash2, publicSource: publicSo
     energyLabel: item.energyLabel || "",
     gesLabel: item.gesLabel || "",
     sourceUpdatedAt: item.sourceUpdatedAt ? new Date(item.sourceUpdatedAt) : null,
-    ...item.legacyUrl ? { legacyUrl: item.legacyUrl } : {}
+    ...item.legacyUrl ? { legacyUrl: item.legacyUrl } : {},
+    // Display-ready texts the editor connects to, one per « Fiche · » field.
+    ...ficheFields(item)
   };
   return { ...record, contentHash: hash2(record) };
 }
@@ -3914,12 +3325,12 @@ function decideAlert(previous, outcome, now) {
 
 // velo/backend/hektor-alert.js
 import { notifications } from "wix-crm-backend";
-async function notifyOperators({ title, body }, settings3) {
-  await notifications.notify(String(body).slice(0, 500), [...settings3.channels], {
+async function notifyOperators({ title, body }, settings2) {
+  await notifications.notify(String(body).slice(0, 500), [...settings2.channels], {
     title: String(title).slice(0, 80),
     actionTitle: "Ouvrir le CMS",
-    actionTarget: { url: settings3.actionUrl },
-    recipients: { role: settings3.recipientsRole }
+    actionTarget: { url: settings2.actionUrl },
+    recipients: { role: settings2.recipientsRole }
   });
 }
 
@@ -3947,46 +3358,8 @@ function sftpIngest() {
       return source;
     },
     prepareArchive: createHektorArchiveParser(yauzl),
-    readRemotePhotos: (references) => readHektorRemotePhotos(references, {
-      ...HEKTOR.media.remote,
-      maxImageBytes: HEKTOR.media.maxImageBytes
-    }),
     mediaStore: createHektorMediaStore({ cacheCollection: HEKTOR.mediaCollection, ...HEKTOR.media })
   });
-}
-async function readBridgeSnapshot() {
-  const [endpoint, token] = await Promise.all([
-    secretValue(HEKTOR.bridgeUrlSecret),
-    secretValue(HEKTOR.bridgeTokenSecret)
-  ]);
-  const url = new URL(endpoint);
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) throw new Error("INVALID_BRIDGE_URL");
-  let timer;
-  try {
-    return await Promise.race([
-      (async () => {
-        const response = await fetch(url.href, {
-          method: "get",
-          redirect: "error",
-          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
-        });
-        if (!response.ok) throw new Error("BRIDGE_UNAVAILABLE");
-        const body = await response.text();
-        if (Buffer3.byteLength(body, "utf8") > HEKTOR.maxResponseBytes) throw new Error("BRIDGE_RESPONSE_TOO_LARGE");
-        return validateSnapshot(JSON.parse(body), HEKTOR);
-      })(),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("BRIDGE_TIMEOUT")), 15e3);
-      })
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-async function readSnapshot({ dryRun }) {
-  if (HEKTOR.sourceMode === "sftp") return sftpIngest().readSnapshot({ dryRun });
-  if (HEKTOR.sourceMode === "bridge") return readBridgeSnapshot();
-  throw new Error("HEKTOR_SOURCE_MODE_INVALID");
 }
 async function oneControl(id) {
   const result = await wixData2.query(HEKTOR.controlCollection).eq("_id", id).limit(1).find(READ);
@@ -4104,7 +3477,7 @@ async function runHektorSync({ dryRun = true, approvedRemovalFingerprint = "" } 
   if (!dryRun && !runtime.sync) throw new Error("HEKTOR_SYNC_SWITCHED_OFF");
   if (typeof approvedRemovalFingerprint !== "string" || approvedRemovalFingerprint && !/^[a-f0-9]{64}$/.test(approvedRemovalFingerprint)) throw new Error("INVALID_APPROVAL");
   let preview;
-  if (dryRun && HEKTOR.sourceMode === "sftp") {
+  if (dryRun) {
     preview = await sftpIngest().previewSnapshot();
     if (!preview.snapshot) return { ...preview.summary, dryRun: true, status: "blocked" };
   }
@@ -4115,7 +3488,6 @@ async function runHektorSync({ dryRun = true, approvedRemovalFingerprint = "" } 
     releaseLock,
     async readSnapshot() {
       if (preview) return preview.snapshot;
-      if (HEKTOR.sourceMode !== "sftp") return readSnapshot({ dryRun });
       const fed = await sftpIngest().runFeed({ allowMediaWrites: mediaWritesAllowed(runtime) });
       if (!fed.snapshot) throw new Error("HEKTOR_MEDIA_NOT_READY");
       source = fed.source;
@@ -4134,7 +3506,6 @@ async function readHektorSyncStatus() {
   ]);
   return {
     enabled: HEKTOR.enabled,
-    sourceMode: HEKTOR.sourceMode,
     switch: runtime,
     publicSource,
     mediaPreparationEnabled: HEKTOR.mediaPreparationEnabled,
@@ -4219,9 +3590,7 @@ function integrationReadiness() {
       wixImageUrl: typeof media2?.getImageUrl === "function",
       socket: typeof Socket2 === "function",
       writable: typeof Writable2 === "function",
-      sha256: typeof createHash5 === "function",
-      httpsGet: typeof https2?.get === "function",
-      dnsLookup: typeof lookup === "function"
+      sha256: typeof createHash4 === "function"
     },
     actions: {
       prepareFeed: hektorSftpReadiness(HEKTOR).configurationReady,
