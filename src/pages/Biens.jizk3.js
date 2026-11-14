@@ -477,6 +477,8 @@ function buildListingView(input) {
     energyDate: Boolean(view.energy.date), energyReference: Boolean(view.energy.reference),
     financial: !soldListing && Boolean(view.financialRows.length || view.financialNotes.length || view.feeScheduleUrl || view.feesShort),
     rental: transaction === 'rent' && Boolean(view.rentalRows.length || view.rentalNotes.length || view.feeScheduleUrl),
+    // Un bien vendu n'est plus à proposer : pas de bouton « Appeler l'agence ».
+    callButton: !soldListing,
   });
   view.visibility.energyFinance = view.visibility.energy || view.visibility.financial || view.visibility.rental;
   return view;
@@ -572,6 +574,7 @@ async function renderListingView(view) {
   setText('#text13', view.priceLabel);
   setText('#text11', view.transactionTypeLabel);
   setText('#text14', view.feesShort);
+  visible('#button5', view.visibility.callButton);
   setText('#text16', view.description);
   const gallery = $w('#gallery2');
   if (gallery) gallery.items = view.gallery;
