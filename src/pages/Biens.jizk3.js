@@ -509,26 +509,17 @@ function familySectionFor(item, feeScheduleUrl) {
   const { name } = config;
   const field = key => text(item[key]);
   const layer = (type, information) => familyLayer(name, type, information);
-  const energyClass = field('ficheClasseEnergie');
-  const gesClass = field('ficheClasseGes');
-  const energyCost = field('ficheDepenseEnergie');
-  const mentions = field('ficheMentions');
-  // texts : un texte dynamique reçoit sa valeur et se replie quand elle est vide.
-  // shown : une boîte (ou le libellé fixe du GES) se replie avec la valeur qu'elle accompagne.
-  const texts = [[layer('text', 'Mentions'), mentions]];
-  const shown = [];
+  // Seuls les calques qui reçoivent une valeur sont nommés : un texte dynamique se replie quand sa valeur est vide.
+  const texts = [[layer('text', 'Mentions'), field('ficheMentions')]];
   if (config.diagnostic) {
-    texts.push([layer('text', 'ClasseEnergie'), energyClass], [layer('text', 'Consommation'), field('ficheConsommation')],
-      [layer('text', 'ClasseGes'), gesClass], [layer('text', 'Emissions'), field('ficheEmissions')],
-      [layer('text', 'DepenseEnergie'), energyCost]);
-    shown.push([layer('box', 'Diagnostic'), Boolean(energyClass)], [layer('text', 'LibelleGes'), Boolean(gesClass)],
-      [layer('box', 'ClasseGes'), Boolean(gesClass)], [layer('box', 'DepenseEnergie'), Boolean(energyCost)]);
+    texts.push([layer('text', 'ClasseEnergie'), field('ficheClasseEnergie')], [layer('text', 'Consommation'), field('ficheConsommation')],
+      [layer('text', 'ClasseGes'), field('ficheClasseGes')], [layer('text', 'Emissions'), field('ficheEmissions')],
+      [layer('text', 'DepenseEnergie'), field('ficheDepenseEnergie')]);
   }
   const rows = config.lines.map(([key, label, source]) => ({ _id: `ligne-${key}`, label, value: field(source) }))
     .filter(row => row.value);
   const feeUrl = safeWebUrl(feeScheduleUrl);
-  return { name, texts, shown, rows, feeUrl,
-    filled: Boolean((config.diagnostic && energyClass) || rows.length || mentions || feeUrl) };
+  return { name, texts, rows, feeUrl, filled: Boolean(texts.some(([, value]) => value) || rows.length || feeUrl) };
 }
 
 const BATHROOM_ICON = "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"100 -860 760 760\" width=\"24\" viewBox=\"100 -860 760 760\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M385.23-254.77q10.15-10.15 10.15-25.23t-10.15-25.23T360-315.38t-25.23 10.15T324.62-280t10.15 25.23T360-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-315.38t-25.23 10.15T444.62-280t10.15 25.23T480-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-315.38t-25.23 10.15T564.62-280t10.15 25.23T600-244.62t25.23-10.15m-240-120q10.15-10.15 10.15-25.23t-10.15-25.23T360-435.38t-25.23 10.15T324.62-400t10.15 25.23T360-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-435.38t-25.23 10.15T444.62-400t10.15 25.23T480-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-435.38t-25.23 10.15T564.62-400t10.15 25.23T600-364.62t25.23-10.15M292.31-492.31h375.38V-520q0-77.61-55.04-132.65T480-707.69t-132.65 55.04T292.31-520zM342-540q8-51 46.5-85.5T480-660t91.5 34.5T618-540zM172.31-100Q142-100 121-121t-21-51.31v-615.38Q100-818 121-839t51.31-21h615.38Q818-860 839-839t21 51.31v615.38Q860-142 839-121t-51.31 21zm0-60h615.38q4.62 0 8.46-3.85 3.85-3.84 3.85-8.46v-615.38q0-4.62-3.85-8.46-3.84-3.85-8.46-3.85H172.31q-4.62 0-8.46 3.85-3.85 3.84-3.85 8.46v615.38q0 4.62 3.85 8.46 3.84 3.85 8.46 3.85M160-160v-640z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n";
@@ -723,7 +714,6 @@ async function renderListingView(view) {
     const feeButton = familyLayer(name, 'button', 'Bareme');
     if (current) {
       for (const [id, value] of current.texts) setText(id, value);
-      for (const [id, show] of current.shown) visible(id, show);
       const button = $w(feeButton);
       if (button && current.feeUrl) {
         button.link = current.feeUrl;
