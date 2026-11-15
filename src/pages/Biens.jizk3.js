@@ -487,7 +487,6 @@ function buildListingView(input) {
 
 // Sections par famille de bien. L'import écrit dans le CMS des textes « Fiche · » prêts à afficher ; la page les
 // pose tels quels dans les calques que Nicolas nomme type + Famille + Information (#textLogementMentions…).
-// Une famille entre dans FAMILY_SECTIONS quand ses calques sont nommés dans l'éditeur ; d'ici là sa section reste repliée.
 const RENTAL_LINES = [
   ['loyer', 'Loyer', 'ficheLoyer'],
   ['charges', 'Charges', 'ficheCharges'],
@@ -496,13 +495,25 @@ const RENTAL_LINES = [
   ['encadrement', 'Encadrement des loyers', 'ficheEncadrement'],
   ['copropriete', 'Copropriété', 'ficheCopropriete'],
 ];
+const SALE_LINES = [
+  ['honoraires', 'Honoraires', 'ficheHonorairesVente'],
+  ['taxeFonciere', 'Taxe foncière', 'ficheTaxeFonciere'],
+  ['copropriete', 'Copropriété', 'ficheCopropriete'],
+];
+// Ce que chaque section contient dans l'éditeur (calques nommés par Nicolas) :
+// diagnostic : les textes du DPE ; 'repliable' quand ses boîtes sont nommées pour se replier (biens sans DPE, sans GES, sans dépense) ;
+// lines : les lignes du répéteur ; lineLabel : la ligne modèle a un texte de libellé ; card : carte nommée, repliée sans ligne ;
+// mentions, bareme : la section a le texte des mentions et le bouton du barème.
 const FAMILY_SECTIONS = {
-  logement: { name: 'Logement', diagnostic: true, lines: RENTAL_LINES },
+  logement: { name: 'Logement', diagnostic: 'fixe', lines: RENTAL_LINES, lineLabel: true, mentions: true, bareme: true },
+  stationnement: { name: 'Stationnement', lines: RENTAL_LINES, lineLabel: true },
+  professionnel: { name: 'Professionnel', lines: RENTAL_LINES, lineLabel: true },
+  vendu: { name: 'Vendu', diagnostic: 'repliable', lines: [SALE_LINES[2]], lineLabel: false, card: 'Copropriete' },
+  vente: { name: 'Vente', diagnostic: 'repliable', lines: SALE_LINES, lineLabel: true, mentions: true, bareme: true },
 };
-const FAMILY_SECTION_NAMES = ['Logement', 'Stationnement', 'Professionnel', 'Vendu', 'Vente'];
 const familyLayer = (name, type, information) => `#${type}${name}${information}`;
-const familyRepeater = name => ({ id: `#repeater${name}Lignes`,
-  label: familyLayer(name, 'text', 'LigneLibelle'), value: familyLayer(name, 'text', 'LigneValeur') });
+const familyRepeater = ({ name, lineLabel }) => ({ id: `#repeater${name}Lignes`,
+  label: lineLabel ? familyLayer(name, 'text', 'LigneLibelle') : '', value: familyLayer(name, 'text', 'LigneValeur') });
 
 function familySectionFor(item, feeScheduleUrl) {
   const config = FAMILY_SECTIONS[text(item.ficheFamille)];
@@ -510,17 +521,24 @@ function familySectionFor(item, feeScheduleUrl) {
   const { name } = config;
   const field = key => text(item[key]);
   const layer = (type, information) => familyLayer(name, type, information);
-  // Seuls les calques qui reçoivent une valeur sont nommés : un texte dynamique se replie quand sa valeur est vide.
-  const texts = [[layer('text', 'Mentions'), field('ficheMentions')]];
+  // texts : un texte dynamique reçoit sa valeur et se replie quand elle est vide.
+  // shown : une boîte nommée se replie avec la valeur qu'elle porte.
+  const texts = config.mentions ? [[layer('text', 'Mentions'), field('ficheMentions')]] : [];
+  const shown = [];
   if (config.diagnostic) {
     texts.push([layer('text', 'ClasseEnergie'), field('ficheClasseEnergie')], [layer('text', 'Consommation'), field('ficheConsommation')],
       [layer('text', 'ClasseGes'), field('ficheClasseGes')], [layer('text', 'Emissions'), field('ficheEmissions')],
       [layer('text', 'DepenseEnergie'), field('ficheDepenseEnergie')]);
   }
+  if (config.diagnostic === 'repliable') {
+    shown.push([layer('box', 'Diagnostic'), Boolean(field('ficheClasseEnergie'))], [layer('box', 'ClasseGes'), Boolean(field('ficheClasseGes'))],
+      [layer('box', 'DepenseEnergie'), Boolean(field('ficheDepenseEnergie'))]);
+  }
   const rows = config.lines.map(([key, label, source]) => ({ _id: `ligne-${key}`, label, value: field(source) }))
     .filter(row => row.value);
-  const feeUrl = safeWebUrl(feeScheduleUrl);
-  return { name, texts, rows, feeUrl, filled: Boolean(texts.some(([, value]) => value) || rows.length || feeUrl) };
+  if (config.card) shown.push([layer('box', config.card), rows.length > 0]);
+  const feeUrl = config.bareme ? safeWebUrl(feeScheduleUrl) : '';
+  return { config, texts, shown, rows, feeUrl, filled: Boolean(texts.some(([, value]) => value) || rows.length || feeUrl) };
 }
 
 const BATHROOM_ICON = "\r\n<svg preserveAspectRatio=\"xMidYMid meet\" data-bbox=\"100 -860 760 760\" width=\"24\" viewBox=\"100 -860 760 760\" height=\"24\" xmlns=\"http://www.w3.org/2000/svg\" data-type=\"color\" role=\"presentation\" aria-hidden=\"true\" aria-label=\"\">\n    <g>\n        <path d=\"M385.23-254.77q10.15-10.15 10.15-25.23t-10.15-25.23T360-315.38t-25.23 10.15T324.62-280t10.15 25.23T360-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-315.38t-25.23 10.15T444.62-280t10.15 25.23T480-244.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-315.38t-25.23 10.15T564.62-280t10.15 25.23T600-244.62t25.23-10.15m-240-120q10.15-10.15 10.15-25.23t-10.15-25.23T360-435.38t-25.23 10.15T324.62-400t10.15 25.23T360-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T480-435.38t-25.23 10.15T444.62-400t10.15 25.23T480-364.62t25.23-10.15m120 0q10.15-10.15 10.15-25.23t-10.15-25.23T600-435.38t-25.23 10.15T564.62-400t10.15 25.23T600-364.62t25.23-10.15M292.31-492.31h375.38V-520q0-77.61-55.04-132.65T480-707.69t-132.65 55.04T292.31-520zM342-540q8-51 46.5-85.5T480-660t91.5 34.5T618-540zM172.31-100Q142-100 121-121t-21-51.31v-615.38Q100-818 121-839t51.31-21h615.38Q818-860 839-839t21 51.31v615.38Q860-142 839-121t-51.31 21zm0-60h615.38q4.62 0 8.46-3.85 3.85-3.84 3.85-8.46v-615.38q0-4.62-3.85-8.46-3.84-3.85-8.46-3.85H172.31q-4.62 0-8.46 3.85-3.85 3.84-3.85 8.46v615.38q0 4.62 3.85 8.46 3.84 3.85 8.46 3.85M160-160v-640z\" fill=\"#B4361A\" data-color=\"1\"></path>\n    </g>\n</svg>\n";
@@ -544,7 +562,7 @@ const REPEATERS = [
 ];
 
 $w.onReady(() => {
-  for (const config of [...REPEATERS, ...Object.values(FAMILY_SECTIONS).map(section => familyRepeater(section.name))]) {
+  for (const config of [...REPEATERS, ...Object.values(FAMILY_SECTIONS).map(familyRepeater)]) {
     const rep = $w(config.id);
     if (rep && typeof rep.onItemReady === 'function') {
       rep.onItemReady(($item, row) => renderRepeaterRow($item, row, config));
@@ -639,23 +657,25 @@ async function renderListingView(view) {
   visible('#box19', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
   visible('#section6', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
 
-  // Sections par famille. Les cinq existent dans l'éditeur ; celle du bien se remplit puis se déplie en dernier,
-  // les autres restent repliées, y compris celles dont les calques ne sont pas encore nommés.
+  // Sections par famille : celle du bien se remplit puis se déplie en dernier ; les autres restent repliées.
   const family = view.familySection;
-  for (const name of FAMILY_SECTION_NAMES) {
-    const current = family && family.name === name ? family : null;
+  for (const config of Object.values(FAMILY_SECTIONS)) {
+    const current = family && family.config === config ? family : null;
     if (current) {
       for (const [id, value] of current.texts) setText(id, value);
-      fillRepeater(familyRepeater(name), current.rows);
-      const feeButton = familyLayer(name, 'button', 'Bareme');
-      const button = $w(feeButton);
-      if (button && current.feeUrl) {
-        button.link = current.feeUrl;
-        button.target = '_blank';
+      for (const [id, show] of current.shown) visible(id, show);
+      fillRepeater(familyRepeater(config), current.rows);
+      if (config.bareme) {
+        const feeButton = familyLayer(config.name, 'button', 'Bareme');
+        const button = $w(feeButton);
+        if (button && current.feeUrl) {
+          button.link = current.feeUrl;
+          button.target = '_blank';
+        }
+        visible(feeButton, Boolean(current.feeUrl));
       }
-      visible(feeButton, Boolean(current.feeUrl));
     }
-    visible(`#section${name}`, Boolean(current && current.filled));
+    visible(`#section${config.name}`, Boolean(current && current.filled));
   }
   await Promise.all(changes);
 }
