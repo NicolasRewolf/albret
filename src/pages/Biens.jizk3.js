@@ -487,7 +487,7 @@ function buildListingView(input) {
 
 // Sections par famille de bien. L'import écrit dans le CMS des textes « Fiche · » prêts à afficher ; la page les
 // pose tels quels dans les calques que Nicolas nomme type + Famille + Information (#textLogementMentions…).
-// Une famille entre dans FAMILY_SECTIONS quand sa section existe dans l'éditeur ; les autres passent par #section8.
+// Une famille entre dans FAMILY_SECTIONS quand ses calques sont nommés dans l'éditeur ; d'ici là sa section reste repliée.
 const RENTAL_LINES = [
   ['loyer', 'Loyer', 'ficheLoyer'],
   ['charges', 'Charges', 'ficheCharges'],
@@ -499,6 +499,7 @@ const RENTAL_LINES = [
 const FAMILY_SECTIONS = {
   logement: { name: 'Logement', diagnostic: true, lines: RENTAL_LINES },
 };
+const FAMILY_SECTION_NAMES = ['Logement', 'Stationnement', 'Professionnel', 'Vendu', 'Vente'];
 const familyLayer = (name, type, information) => `#${type}${name}${information}`;
 const familyRepeater = name => ({ id: `#repeater${name}Lignes`,
   label: familyLayer(name, 'text', 'LigneLibelle'), value: familyLayer(name, 'text', 'LigneValeur') });
@@ -540,7 +541,6 @@ const REPEATERS = [
   { id: '#repeater3', key: 'surfaces', label: '#text29', value: '#text30', heading: '#text31' },
   { id: '#repeater4', key: 'layout', label: '#text34', value: '#text33', heading: '#text32' },
   { id: '#repeater5', key: 'comfort', label: '#text37', value: '#text36', heading: '#text35' },
-  { id: '#repeater6', key: 'rentalRows', label: '#text81', value: '#text80' },
 ];
 
 $w.onReady(() => {
@@ -602,10 +602,6 @@ async function renderListingView(view) {
     if (el) el.text = typeof value === 'string' ? value : '';
     visible(id, Boolean(value));
   };
-  const setHtml = (id, markup) => {
-    const el = $w(id);
-    if (el) el.html = markup;
-  };
   setText('#text10', view.title);
   setText('#text12', view.city);
   setText('#text84', view.reference ? `Réf : ${view.reference}` : '');
@@ -643,77 +639,15 @@ async function renderListingView(view) {
   visible('#box19', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
   visible('#section6', Boolean(view.title || view.description || view.gallery.length || view.priceLabel));
 
-  const energy = view.energy;
-  const hasDpe = Boolean(energy.dpe.visible);
-  const hasGes = Boolean(energy.ges.label || energy.ges.consumption);
-  setText('#text38', energy.visible ? view.transactionTypeLabel : '');
-  setText('#text39', energy.visible ? 'Diagnostic énergétique' : '');
-  setText('#text42', energy.dpe.label);
-  setText('#text43', [energy.dpe.consumption, energy.dpe.finalConsumption ? `Énergie finale : ${energy.dpe.finalConsumption}` : ''].filter(Boolean).join('\n'));
-  setText('#text45', energy.ges.label);
-  setText('#text44', energy.ges.consumption);
-  const energyExtras = energy.rows.length > 0;
-  setHtml('#text47', energyEstimateHtml(energy));
-  visible('#text47', Boolean(energy.annualRange || energyExtras));
-  setText('#text46', energy.annualRange ? 'Dépense annuelle estimée' : energyExtras ? 'Informations complémentaires' : '');
-  setText('#text49', energy.date);
-  setText('#text51', energy.reference);
-  visible('#text40', hasDpe);
-  visible('#box31', hasDpe);
-  visible('#text41', hasGes);
-  visible('#box32', hasGes);
-  visible('#box33', Boolean(energy.annualRange || energyExtras));
-  visible('#text48', Boolean(energy.date));
-  visible('#text50', Boolean(energy.reference));
-  visible('#line6', Boolean(energy.annualRange || energyExtras));
-  visible('#line7', Boolean(energy.date || energy.reference));
-  visible('#html1', false);
-  visible('#box30', energy.visible);
-
-  const isSale = view.transaction === 'sale' && view.visibility.financial;
-  const isRental = view.transaction === 'rent';
-  const finance = isSale ? view.financialRows.slice(0, 3) : [];
-  const additionalFinance = isSale ? view.financialRows.slice(3) : [];
-  const pairs = [['#text58', '#text53'], ['#text57', '#text52'], ['#text66', '#text67']];
-  pairs.forEach(([labelId, valueId], index) => {
-    setText(labelId, finance[index]?.label || '');
-    setText(valueId, finance[index]?.value || '');
-  });
-  const notes = isSale ? [...view.financialNotes, view.cleanSaleLegalText].filter(Boolean).join('\n\n') : '';
-  const feeUrl = isSale ? safeWebUrl(view.feeScheduleUrl) : '';
-  const hasFinancial = isSale && Boolean(finance.length || additionalFinance.length || notes || feeUrl);
-  setText('#text65', hasFinancial ? view.transactionTypeLabel : '');
-  setText('#text64', hasFinancial ? view.financialHeading : '');
-  setHtml('#text68', financialNotesHtml(additionalFinance, notes));
-  visible('#text68', Boolean(additionalFinance.length || notes));
-  setHtml('#text69', feeUrl
-    ? `<p><a href="${escapeHtml(feeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
-    : '<p></p>');
-  visible('#text69', Boolean(feeUrl));
-  visible('#box38', Boolean(additionalFinance.length || notes || feeUrl));
-  visible('#achat', hasFinancial);
-
-  const rentalNotes = isRental ? [...view.rentalNotes, view.rentalLegalText].filter(Boolean).join('\n\n') : '';
-  const rentalFeeUrl = isRental ? safeWebUrl(view.feeScheduleUrl) : '';
-  const hasRental = isRental && Boolean(view.rentalRows.length || rentalNotes || rentalFeeUrl);
-  setText('#text79', hasRental ? view.transactionTypeLabel : '');
-  setText('#text78', hasRental ? 'Loyer et conditions' : '');
-  setHtml('#text83', financialNotesHtml([], rentalNotes));
-  visible('#text83', Boolean(rentalNotes));
-  setHtml('#text82', rentalFeeUrl
-    ? `<p><a href="${escapeHtml(rentalFeeUrl)}" target="_blank" rel="noopener noreferrer">Consulter le barème des honoraires ↗</a></p>`
-    : '<p></p>');
-  visible('#text82', Boolean(rentalFeeUrl));
-  visible('#box42', Boolean(rentalNotes || rentalFeeUrl));
-  visible('#location', hasRental);
-  // Une famille qui a sa propre section n'utilise plus #section8.
+  // Sections par famille. Les cinq existent dans l'éditeur ; celle du bien se remplit puis se déplie en dernier,
+  // les autres restent repliées, y compris celles dont les calques ne sont pas encore nommés.
   const family = view.familySection;
-  visible('#section8', !family && (energy.visible || hasFinancial || hasRental));
-  for (const { name } of Object.values(FAMILY_SECTIONS)) {
+  for (const name of FAMILY_SECTION_NAMES) {
     const current = family && family.name === name ? family : null;
-    const feeButton = familyLayer(name, 'button', 'Bareme');
     if (current) {
       for (const [id, value] of current.texts) setText(id, value);
+      fillRepeater(familyRepeater(name), current.rows);
+      const feeButton = familyLayer(name, 'button', 'Bareme');
       const button = $w(feeButton);
       if (button && current.feeUrl) {
         button.link = current.feeUrl;
@@ -721,31 +655,9 @@ async function renderListingView(view) {
       }
       visible(feeButton, Boolean(current.feeUrl));
     }
-    fillRepeater(familyRepeater(name), current ? current.rows : []);
-    // La section se déplie en dernier, une fois ses calques remplis ou repliés.
     visible(`#section${name}`, Boolean(current && current.filled));
   }
   await Promise.all(changes);
-}
-
-function energyEstimateHtml(energy) {
-  const hasSubscription = /,\s*abonnement inclus$/.test(energy.annualRange);
-  const amount = energy.annualRange.replace(/,\s*abonnement inclus$/, '');
-  const parts = [];
-  if (amount) parts.push(`<p style="font-size:20px;line-height:1.35">${escapeHtml(amount)}</p>`);
-  if (hasSubscription) parts.push('<p style="font-size:12px;line-height:1.4">Abonnement inclus.</p>');
-  for (const row of energy.rows) parts.push(
-    `<p style="font-size:12px;line-height:1.4">${escapeHtml(row.label)} : ${escapeHtml(row.value)}</p>`);
-  return parts.join('') || '<p></p>';
-}
-
-function financialNotesHtml(rows, notes) {
-  const parts = [];
-  if (rows.length) parts.push('<p style="font-size:12px;line-height:1.4;font-weight:600">Autres conditions</p>');
-  for (const row of rows) parts.push(
-    `<p style="font-size:12px;line-height:1.4"><span style="font-weight:600">${escapeHtml(row.label)} :</span> ${escapeHtml(row.value)}</p>`);
-  if (notes) parts.push(`<p style="font-size:12px;line-height:1.4">${escapeHtml(notes).replace(/\r?\n/g, '<br>')}</p>`);
-  return parts.join('') || '<p></p>';
 }
 
 function setDisplayed(id, displayed) {
@@ -764,10 +676,4 @@ function safeWebUrl(value) {
     const url = new URL(value);
     return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : '';
   } catch { return ''; }
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, character => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[character]);
 }
