@@ -19,3 +19,44 @@
     width: 100% !important;
   }
 }
+
+/* Gestion locative — cartes du répéteur #repeater1. Classes posées par le code de la page
+   (src/pages/Mandat de gestion.t1uln.js) : une carte ouverte à la fois, ouverture en
+   glissé, texte en fondu, titres des cartes fermées atténués. */
+.cartes .carte {
+  grid-template-rows: auto 0fr !important;
+  transition: grid-template-rows 0.55s cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+.cartes .carte.carte--ouverte {
+  grid-template-rows: auto 1fr !important;
+}
+
+.cartes .carte-texte {
+  min-height: 0 !important;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.3s ease-in-out;
+}
+
+.cartes .carte--ouverte .carte-texte {
+  opacity: 1;
+  transition: opacity 0.45s ease-in-out 0.15s;
+}
+
+.cartes .carte-titre {
+  opacity: 0.45;
+  transition: opacity 0.4s ease-in-out;
+}
+
+.cartes .carte--ouverte .carte-titre {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cartes .carte,
+  .cartes .carte-texte,
+  .cartes .carte-titre {
+    transition: none;
+  }
+}
